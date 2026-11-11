@@ -44,6 +44,11 @@ jobs:
       - name: APK
         working-directory: android/app
         run: ./gradlew --no-daemon -PnxPackStage="$RUNNER_TEMP/ondevice/stage" -PnxGames=0400486024DEC000 -PnxPlay=true apk
+      - name: Sign with the fixed key
+        run: |
+          AS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner
+          "$AS" sign --ks ~/.android/debug.keystore --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android android/app/out/anka-native-play.apk
+          "$AS" verify --print-certs android/app/out/anka-native-play.apk | grep SHA-256
       - uses: actions/upload-artifact@v4
         with:
           name: anka-native-play
