@@ -2817,10 +2817,6 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
         pthread_mutex_unlock(&g_tmu);
     }
     if (want != have && want == 0 && ali) have = want;   // (float binding, integer image: its own view)
-    // A sampled float binding over an integer colour image gets its own view too: the translator types a fetch float for want of the format, and the console returns the
-    // texel's integer bits, which the shader reinterprets. Ocarina of Time's AA pass d17eefaff4f0bc23 binding 2 reads f8965bffbdf51d78's R16G16_UINT edges so: unbound
-    // before, its blend weights were zero
-    if (want != have && want == 0 && !storage && im->f.kind < 3 && !compressed(&im->f) && VKA_ENV("DM_VK_SAMPLE_INT_AS_FLOAT", 1)) have = want;
     if (want != have && !(im->f.kind >= 3 && want == 0)) return VK_NULL_HANDLE;
     if (imo) *imo = im;
     if (r32) { if (!e.has_v) { memset(&e.v, 0, sizeof e.v); e.has_v = 1; } e.v.set_format = 1; e.v.format = want == 1 ? 0x0B : 0x0C; }   // (NVN R32_UI / R32_I: view_of's format)
