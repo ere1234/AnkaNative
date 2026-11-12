@@ -1306,9 +1306,12 @@ static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) {
     size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw_idx, ind); memcpy(rec(c, OP_DRAW_IDX, n), &d, n); }
 #if defined(__ANDROID__)
 // NVN2 mesh draw: count task workgroups (or mesh workgroups when the program has no task shader) from first, with the bound program's task and mesh shaders. A draw like the
-// others (it opens and joins render passes the same way); the Vulkan replay draws it with vkCmdDrawMeshTasksEXT (vka_draw.c). The signature is the game's calls' (switch2mac
-// hle_nvn.c, MIT: x1 = 0, x2 = workgroups in Mario Kart World). The indirect, 3D and multi-draw variants keep the unimplemented stub (a red line when one is called)
+// others (it opens and joins render passes the same way); the Vulkan replay draws it with vkCmdDrawMeshTasksEXT, or as compute where the device has no mesh stage (vka_draw.c).
+// The signature is the game's calls' (switch2mac hle_nvn.c, MIT: x1 = 0, x2 = workgroups in Mario Kart World). The indirect one reads {count, first} (VK_NV_mesh_shader's
+// layout) from the GPU at ind (x1; Ocarina of Time's main draw of meshes: about 2,000 calls in a 20-minute session's log, with x2 = 0x10 at most calls: not an argument). The 3D and
+// multi-draw variants keep the unimplemented stub (a red line when one is called)
 NVN_NOPROTO(nvnCommandBufferDrawMeshTasks, void, NVNcommandBuffer *c, int first, int count) { rec_draw(c, (p_draw){NVN_PRIM_MESH, first, count, 1, 0, 0}); }
+NVN_NOPROTO(nvnCommandBufferDrawMeshTasksIndirect, void, NVNcommandBuffer *c, NVNbufferAddress ind) { rec_draw(c, (p_draw){NVN_PRIM_MESH, 0, 0, 1, 0, ind}); }
 #endif
 static void copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) { *has = v != NULL; if (v) *dst = *(const view_t *)v; }
 // Records with textures snapshot the texture objects (0x80 bytes each, after the record struct) and replay reads the snapshots: an NVN command no longer depends on the API object once recorded, and the game may finalize, free or reuse it before submitting.

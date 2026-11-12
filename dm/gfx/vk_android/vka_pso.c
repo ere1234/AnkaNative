@@ -64,13 +64,16 @@ typedef struct { uint32_t n; struct { uint16_t binding; uint8_t desc, pad; uint1
 static kmap g_layouts = {.klen = sizeof(lkey)};
 static uint64_t g_nlayouts;
 
+// The shaders of sh a layout takes: a compute layout the compute shader, or a task / mesh program made a compute shader (vka_shader.emu 1, vka_draw.c "Mesh draws as
+// compute"); a graphics layout the other stages
+static int lay_takes(const vka_shader *s, int st, int compute) { int emu = s && s->emu == 1; return s && (compute ? st == 5 || emu : st != 5 && !emu); }
 // The layout of a set of shaders, remembered by the shaders themselves: building the bindings key (3 KB) and hashing it was a third of the replay's CPU time at 5,500 draws a frame
 typedef struct { vka_shader *sh[VKA_NSTAGE]; uint64_t compute; } skey;
 static kmap g_lshort = {.klen = sizeof(skey)};
 static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out);
 int vka_layout_of(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out) {
     skey sk; memset(&sk, 0, sizeof sk);
-    for (int st = 0; st < VKA_NSTAGE; st++) if ((st == 5) == (compute != 0)) sk.sh[st] = sh[st];
+    for (int st = 0; st < VKA_NSTAGE; st++) if (lay_takes(sh[st], st, compute)) sk.sh[st] = sh[st];
     sk.compute = compute != 0;
     uint64_t h = fnv(&sk, sizeof sk, 1469598103934665603ull);
     pthread_mutex_lock(&g_mu);
@@ -90,16 +93,22 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
     uint32_t ndesc = 0;
     for (int st = 0; st < VKA_NSTAGE; st++) {
         const vka_shader *s = sh[st];
-        if (!s || (st == 5) != (compute != 0)) continue;
+        if (!lay_takes(s, st, compute)) continue;
+        uint16_t sf = (uint16_t)(s->emu == 1 ? VK_SHADER_STAGE_COMPUTE_BIT : stage_bit(s->e->stage));
         for (unsigned i = 0; i < s->e->bind_count; i++) {
             const dmsh_vk_bind *b = &s->b[i];
             if (b->set != DMSH_VK_SET_DRAW || b->kind == DMSH_VK_KIND_TEX_POOL || b->kind == DMSH_VK_KIND_SAMP_POOL) continue;
             if (k.n == MAXB) { VRED_ONCE("more than %d set-0 bindings in one pipeline", MAXB); return 0; }
-            k.b[k.n].binding = b->binding; k.b[k.n].desc = b->desc; k.b[k.n].count = b->count ? b->count : 1; k.b[k.n].stages = (uint16_t)stage_bit(s->e->stage);
+            k.b[k.n].binding = b->binding; k.b[k.n].desc = b->desc; k.b[k.n].count = b->count ? b->count : 1; k.b[k.n].stages = sf;
             ndesc += k.b[k.n].count; k.n++;
         }
         if (s->gs_fx > 0 && k.n < MAXB) {   // the claim words of a geometry shader that writes memory (vka_spv_gs_claim)
             k.b[k.n].binding = VKA_GS_CLAIM_BINDING; k.b[k.n].desc = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; k.b[k.n].count = 1; k.b[k.n].stages = (uint16_t)stage_bit(s->e->stage); ndesc++; k.n++;
+        }
+        // Mesh draws as compute: a task / mesh program's record and output buffers, the vertex shader's output buffer (vka_draw.c)
+        for (int j = s->emu == 1 ? 0 : 1; s->emu && j < 2; j++) {
+            if (k.n == MAXB) { VRED_ONCE("more than %d set-0 bindings in one pipeline", MAXB); return 0; }
+            k.b[k.n].binding = j ? VKA_ME_OUT_BINDING : VKA_ME_REC_BINDING; k.b[k.n].desc = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; k.b[k.n].count = 1; k.b[k.n].stages = sf; ndesc++; k.n++;
         }
     }
     // Sorted by binding, so the same set of records gives the same key whatever the order of stages
@@ -1139,8 +1148,9 @@ static void gfx_build(gval *g, size_t len, vka_shader *const sh[VKA_NSTAGE], con
         if (!p && !linked) p = full_pipeline(P, sh, prewarm ? " (prewarm)" : async ? " in the background (asynchronous)" : NULL);
     }
     free(P);
-    // (mesh pipelines stay out of the prewarm list: its records name the five vertex pipeline stages only; open)
-    if (!prewarm && !sh[7]) { pw_note(0, sh, k, (uint32_t)(len - offsetof(gkey_full, k))); pw_explain(sh, k, (uint32_t)(len - offsetof(gkey_full, k)), (now_ns() - t_make) / 1e6, linked, async ? " in the background" : " on the frame path"); }
+    // (mesh pipelines stay out of the prewarm list: its records name the five vertex pipeline stages only; open. So do the draws of mesh draws as compute: their vertex
+    // shader is the replay's, in no library)
+    if (!prewarm && !sh[7] && !(sh[0] && sh[0]->emu)) { pw_note(0, sh, k, (uint32_t)(len - offsetof(gkey_full, k))); pw_explain(sh, k, (uint32_t)(len - offsetof(gkey_full, k)), (now_ns() - t_make) / 1e6, linked, async ? " in the background" : " on the frame path"); }
     pthread_mutex_lock(&g_mu);
     __atomic_store_n(&g->linked, (uint8_t)linked, __ATOMIC_RELEASE); __atomic_store_n(&g->p, p, __ATOMIC_RELEASE); __atomic_store_n(&g->busy, 0, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_busy_cv);
@@ -1219,4 +1229,48 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
     return p;
 }
 VkPipeline vka_cs_pipeline(vka_shader *cs, const vka_layout *lay) { int made; return cs_obtain(cs, lay, 0, &made); }
+
+// ---------- Task and mesh programs as compute shaders (vka_draw.c "Mesh draws as compute") ----------
+// The pipeline of a program made a compute shader (vka_shader.emu 1), with the specialization its mesh pipeline stage would have had: GL's depth convention (SpecId 0) on
+// a mesh program that takes it, the texture-use feedback constant; the compute stage's subgroup pin (it runs as one, sg_plan). Keyed on the shader, layout and convention;
+// made on the frame path, and kept out of the prewarm list (its module is the replay's rewrite, not a library module)
+typedef struct { vka_shader *s; VkPipelineLayout layout; uint64_t gl; } mekey;
+static kmap g_me = {.klen = sizeof(mekey)};
+VkPipeline vka_me_pipeline(vka_shader *s, const vka_layout *lay, int gl_depth) {
+    if (!s || s->emu != 1 || !s->mods[DMSH_VK_MOD_BASE]) return VK_NULL_HANDLE;
+    mekey k; memset(&k, 0, sizeof k); k.s = s; k.layout = lay->layout; k.gl = gl_depth && s->e->stage == DMSH_VK_STAGE_MS && (s->e->flags & DMSH_VK_F_GL_DEPTH);
+    uint64_t h = fnv(&k, sizeof k, 1469598103934665603ull);
+    pthread_mutex_lock(&g_mu); gval *g = km_get(&g_me, &k, h); pthread_mutex_unlock(&g_mu);
+    if (g) return g->p;
+    pc_open();
+    uint64_t t0 = now_ns();
+    uint32_t pin = (s->e->flags & DMSH_VK_F_SUBGROUP) ? vka_shader_sg_pin(DMSH_VK_STAGE_CS) : 0;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rsg = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = pin};
+    struct { VkBool32 gl; uint32_t afunc; VkBool32 texfb; } sd = {VK_TRUE, 0, VK_TRUE};   // (pstate_fill's layout: the GL depth bool, the alpha function, the feedback bool)
+    VkSpecializationMapEntry se[2]; uint32_t nse = 0;
+    if (k.gl) se[nse++] = (VkSpecializationMapEntry){DMSH_VK_SPEC_GL_DEPTH, 0, sizeof(VkBool32)};
+    if ((s->e->flags & DMSH_VK_F_TEXFB) && vka_tex_fb_spec()) se[nse++] = (VkSpecializationMapEntry){DMSH_VK_SPEC_TEXFB, 8, sizeof(VkBool32)};
+    VkSpecializationInfo si = {nse, se, sizeof sd, &sd};
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = lay->layout,
+        .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin ? &rsg : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = s->mods[DMSH_VK_MOD_BASE], .pName = "main",
+                  .pSpecializationInfo = nse ? &si : NULL}};
+    VkPipeline p = VK_NULL_HANDLE;
+    int bs = build_begin(s->e->stage == DMSH_VK_STAGE_TS ? "task program as a compute pipeline" : "mesh program as a compute pipeline", s->key, 0);
+    VkResult r = vk.vkCreateComputePipelines(V.dev, g_pc, 1, &ci, NULL, &p);
+    build_end(bs);
+    if (r) p = VK_NULL_HANDLE;
+    uint64_t dns = now_ns() - t0;
+    pthread_mutex_lock(&g_mu);
+    if (r) g_nfail++; else { g_ncs++; g_made++; g_frame_made++; }
+    g_create_ms += dns / 1e6; g_create_ns += dns;
+    gval *had = km_get(&g_me, &k, h);
+    if (!had) { g = calloc(1, sizeof *g); if (g) { g->p = p; km_put(&g_me, &k, h, g); } }
+    pthread_mutex_unlock(&g_mu);
+    if (had) { if (p) vk.vkDestroyPipeline(V.dev, p, NULL); return had->p; }   // (made by another thread meanwhile; this one was never used)
+    if (!r && g_pc) pc_added(dns, PC_NEW);
+    if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("%s program %016llx as a compute pipeline: %d; its draws are skipped", s->e->stage == DMSH_VK_STAGE_TS ? "task" : "mesh", (unsigned long long)s->key, r); }
+    else { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 32) VLOG("%s program %016llx as a compute pipeline: %.1f ms (subgroups %s, GL depth %s)", s->e->stage == DMSH_VK_STAGE_TS ? "task" : "mesh",
+                                                                       (unsigned long long)s->key, dns / 1e6, pin ? (pin == 64 ? "pinned 64" : "pinned 32") : "as built", k.gl ? "on" : "off"); }
+    return p;
+}
 #endif

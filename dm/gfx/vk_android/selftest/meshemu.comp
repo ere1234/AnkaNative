@@ -1,0 +1,54 @@
+#version 450
+// The passes around an NVN2 task / mesh draw on a device without VK_EXT_mesh_shader (vka_draw.c "Mesh draws as compute"). The buffer at binding 1 has the layout of
+// vka_spvpatch.h's VKA_ME_*: header words, the indirect arguments of the passes and the draw, the task records from word 32, the map at word mapbase.
+//   mode 0: the header, and the task workgroups (count, or the GPU's word at ind_word of binding 0 for an indirect draw) as the task pass's arguments
+//   mode 1: the header, and the mesh workgroups of a program without a task, the same way, as the first round's mesh pass and draw arguments
+//   mode 2, after the task pass: each record's count summed (the total, at most cap), the map written (mesh workgroup g: its task | its index among that task's << 16),
+//           the first round's arguments
+//   mode 3: a later round's arguments (its mesh workgroups from base)
+// A round runs at most max_slots mesh workgroups (the slots the buffer holds); cap: the mesh workgroups of all the draw's rounds; verts: vertices a mesh workgroup draws
+// (3 x its primitives). The words from VKA_ME_MOST on outlive the draws: the most mesh workgroups a draw asked for, the draws that asked for more than their cap, the
+// draws whose task workgroups were more than max_tasks (the replay logs them)
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P { uint mode, count, ind_word, max_tasks, max_slots, verts, rec_words, mapbase, cap, base, pad0, pad1; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer Ind { uint w[]; } ind;
+layout(set = 0, binding = 1, std430) buffer Emu { uint w[]; } emu;
+shared uint part[256];
+void round_args(uint total) {
+    uint n = total > pc.base ? min(total - pc.base, pc.max_slots) : 0u;
+    emu.w[7] = pc.base;
+    emu.w[20] = n; emu.w[21] = 1u; emu.w[22] = 1u;
+    emu.w[24] = n * pc.verts; emu.w[25] = 1u; emu.w[26] = 0u; emu.w[27] = 0u;
+}
+void asked(uint n) { emu.w[8] = max(emu.w[8], n); if (n > pc.cap) emu.w[9] += 1u; }
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    if (pc.mode != 2u) {
+        if (lid != 0u) return;
+        if (pc.mode == 3u) { round_args(emu.w[6]); return; }
+        uint n = pc.ind_word != 0xffffffffu ? ind.w[pc.ind_word] : pc.count;
+        emu.w[0] = pc.rec_words; emu.w[1] = 0xffffu; emu.w[2] = pc.mode == 0u ? 1u : 0u; emu.w[3] = pc.mapbase; emu.w[4] = pc.max_slots;
+        if (pc.mode == 0u) { if (n > pc.max_tasks) emu.w[10] += 1u; n = min(n, pc.max_tasks); emu.w[5] = n; emu.w[16] = n; emu.w[17] = 1u; emu.w[18] = 1u; }
+        else { asked(n); emu.w[5] = 0u; emu.w[6] = n; round_args(n); }
+        return;
+    }
+    uint T = emu.w[5], S = emu.w[0], mb = emu.w[3];
+    uint per = (T + 255u) / 256u, t0 = min(lid * per, T), t1 = min(t0 + per, T), sum = 0u;
+    for (uint t = t0; t < t1; t++) sum += emu.w[32u + t * S];
+    part[lid] = sum;
+    barrier();
+    if (lid == 0u) {
+        uint acc = 0u;
+        for (uint i = 0u; i < 256u; i++) { uint v = part[i]; part[i] = acc; acc += v; }
+        asked(acc);
+        uint total = min(acc, pc.cap);
+        emu.w[6] = total;
+        round_args(total);
+    }
+    barrier();
+    uint g = part[lid];
+    for (uint t = t0; t < t1; t++) {
+        uint c = emu.w[32u + t * S];
+        for (uint m = 0u; m < c && g < pc.cap; m++, g++) emu.w[mb + g] = t | (m << 16u);
+    }
+}

@@ -204,18 +204,31 @@ static void sh_put(uint64_t key, const vka_shlib *L, vka_shader *s) {
 }
 
 static const char *stage_name(int s) { static const char *n[] = {"vertex", "tess control", "tess evaluation", "geometry", "fragment", "compute", "task", "mesh"}; return s >= 0 && s < 8 ? n[s] : "?"; }
+// NVN2 task / mesh draws on a device without VK_EXT_mesh_shader (or with DM_VK_MESH=0): their programs run as compute shaders and what the mesh program outputs is drawn by
+// a vertex shader of the replay's (vka_spvmesh.c, vka_draw.c "Mesh draws as compute"). Samsung's RADV for Xclipse has no mesh stage: Ocarina of Time's task / mesh draws
+// were skipped there. DM_VK_MESH_EMU (restart only: the shaders are made for it): 0 = skipped as before, else on (default)
+int vka_mesh_emu(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_VK_MESH_EMU"); int v = !V.mesh && !(e && !strcmp(e, "0")); on = v; }
+    return on;
+}
 // What the replay cannot run yet, decided once per shader: refused shaders keep their entry, so the draws that use them are skipped and counted
 static const char *refusal(const vka_shlib *L, const dmsh_vk_entry *e) {
     if (e->flags & (DMSH_VK_F_NV_PASSTHROUGH | DMSH_VK_F_NV_VIEWPORT)) return "NV-only geometry passthrough / viewport mask (a library built before the gs_passthrough answer)";
     if (e->flags & DMSH_VK_F_INTERLOCK) return "fragment shader interlock";
     if (e->stage == DMSH_VK_STAGE_GS && !V.geom) return "a geometry shader on a device without geometryShader";
     if ((e->stage == DMSH_VK_STAGE_TCS || e->stage == DMSH_VK_STAGE_TES) && !V.tess) return "a tessellation shader on a device without tessellationShader";
-    // NVN2 task and mesh programs, and the pixel shaders that read their per-primitive outputs (valid only in a mesh pipeline): only with VK_EXT_mesh_shader (vka_dev.c)
-    if ((e->stage == DMSH_VK_STAGE_TS || e->stage == DMSH_VK_STAGE_MS || (e->flags & DMSH_VK_F_MESH_PRIM)) && !V.mesh) return "a task / mesh shader (or a pixel shader of their per-primitive outputs) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0)";
-    if (e->stage == DMSH_VK_STAGE_TS && !V.task) return "a task shader on a device with mesh shaders but without taskShader";
-    if (e->stage == DMSH_VK_STAGE_TS || e->stage == DMSH_VK_STAGE_MS) {   // the workgroup (the entry's local) within the device's limit
+    // NVN2 task and mesh programs, and the pixel shaders that read their per-primitive outputs (valid only in a mesh pipeline): with VK_EXT_mesh_shader (vka_dev.c), or as
+    // compute shaders and a vertex shader of the replay's (vka_mesh_emu)
+    int tm = e->stage == DMSH_VK_STAGE_TS || e->stage == DMSH_VK_STAGE_MS;
+    if ((tm || (e->flags & DMSH_VK_F_MESH_PRIM)) && !V.mesh && !vka_mesh_emu()) return "a task / mesh shader (or a pixel shader of their per-primitive outputs) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0), with DM_VK_MESH_EMU=0";
+    if (e->stage == DMSH_VK_STAGE_TS && V.mesh && !V.task) return "a task shader on a device with mesh shaders but without taskShader";
+    if (tm) {   // the workgroup (the entry's local) within the device's limit: its mesh stage's, or as a compute shader its compute limits
         uint64_t inv = (uint64_t)e->local[0] * e->local[1] * e->local[2];
-        if (!inv || inv > (e->stage == DMSH_VK_STAGE_TS ? V.task_inv : V.mesh_inv)) return "a task / mesh workgroup larger than the device's (maxTaskWorkGroupInvocations / maxMeshWorkGroupInvocations)";
+        const VkPhysicalDeviceLimits *lm = &V.props.limits;
+        if (V.mesh && (!inv || inv > (e->stage == DMSH_VK_STAGE_TS ? V.task_inv : V.mesh_inv))) return "a task / mesh workgroup larger than the device's (maxTaskWorkGroupInvocations / maxMeshWorkGroupInvocations)";
+        if (!V.mesh && (!inv || inv > lm->maxComputeWorkGroupInvocations || e->local[0] > lm->maxComputeWorkGroupSize[0] || e->local[1] > lm->maxComputeWorkGroupSize[1] || e->local[2] > lm->maxComputeWorkGroupSize[2]))
+            return "a task / mesh workgroup larger than the device's compute workgroups (it runs as a compute shader: maxComputeWorkGroupInvocations / maxComputeWorkGroupSize)";
     }
     const dmsh_vk_bind *b = vka_shlib_binds(L, e);
     for (unsigned i = 0; i < e->bind_count; i++) if (b[i].kind == DMSH_VK_KIND_UNKNOWN) return "a binding the build could not place";
@@ -234,10 +247,20 @@ static void single_lane(uint64_t key, int stage, uint32_t **w, size_t *nb) {
                                                             stage == DMSH_VK_STAGE_GS && V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? "Turnip's geometry stage (DM_VK_SUBGROUP_GS)" : V.subgroup_stages & g_stage_bit[stage] ? "the device's subgroup size in this stage is not the library's and cannot be pinned" : "the device has none in this stage");
     free(*w); *w = o; *nb = on * 4;
 }
+// A pixel shader of a mesh program's per-primitive outputs (DMSH_VK_F_MESH_PRIM) where mesh draws run as compute (vka_mesh_emu): it is drawn with the vertex shader of
+// vka_spv_mesh_vs, which gives the per-primitive values to the three vertices of each primitive, so those inputs become flat ones (vka_spv_fs_mesh_flat). A module that
+// cannot be rewritten is used as it is (a red line): its pipeline is then likely refused
+static void fs_flat(uint64_t key, const dmsh_vk_entry *e, uint32_t **w, size_t *nb) {
+    if (e->stage != DMSH_VK_STAGE_FS || !(e->flags & DMSH_VK_F_MESH_PRIM) || V.mesh || !vka_mesh_emu()) return;
+    size_t on = 0; int ch = 0; char er[256] = ""; uint32_t *o = vka_spv_fs_mesh_flat(*w, *nb / 4, &on, &ch, er, sizeof er);
+    if (!o) { if (er[0]) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("pixel shader %016llx: per-primitive inputs not made flat for mesh draws as compute: %s", (unsigned long long)key, er); } return; }
+    free(*w); *w = o; *nb = on * 4;
+}
 static VkShaderModule spv_module(const vka_shlib *L, const dmsh_vk_entry *e, const dmsh_vk_module *m, uint64_t key, const char **why, char *err, size_t errn) {
     size_t nb = 0; uint32_t *w = vka_shlib_spirv(L, m, &nb, err, errn);
     if (!w) { *why = err; return VK_NULL_HANDLE; }
     if (e->flags & (DMSH_VK_F_SUBGROUP | DMSH_VK_F_TEXFB)) single_lane(key, e->stage, &w, &nb);
+    fs_flat(key, e, &w, &nb);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nb, .pCode = w};
     VkShaderModule mod = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
     free(w);
@@ -319,6 +342,7 @@ VkShaderModule vka_shader_fout_module(vka_shader *s, uint32_t umask, uint32_t sm
     const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_BASE);
     size_t nb = 0; uint32_t *w = m ? vka_shlib_spirv(s->lib, m, &nb, err, sizeof err) : NULL;
     if (w && (s->e->flags & (DMSH_VK_F_SUBGROUP | DMSH_VK_F_TEXFB))) single_lane(s->key, s->e->stage, &w, &nb);
+    if (w) fs_flat(s->key, s->e, &w, &nb);
     size_t on = 0; uint32_t *o = w ? vka_spv_fout_retype(w, nb / 4, umask, smask, &on, err, sizeof err) : NULL;
     if (o) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = on * 4, .pCode = o};
              VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod); if (r) { snprintf(err, sizeof err, "vkCreateShaderModule %d", r); mod = VK_NULL_HANDLE; } else own = 1; }
@@ -340,6 +364,48 @@ int vka_shader_fout_retyped(vka_shader *s, uint32_t umask, uint32_t smask) {
     VkShaderModule m = vka_shader_fout_module(s, umask, smask);
     return m && m != vka_shader_module(s, DMSH_VK_MOD_BASE);
 }
+// A task or mesh program where mesh draws run as compute (vka_mesh_emu): its base module as a compute shader (vka_spv_mesh_compute), with the one-invocation subgroup
+// rewrite of the compute stage (it runs as one: sg_plan); its workgroup memory, which now also holds its task memory and outputs, within the device's compute limit. A mesh
+// program also gets the vertex shader that draws its outputs (vka_spv_mesh_vs), a vka_shader of its own (emu 2) on an entry of the replay's: no records, no inputs.
+// 0 with the reason in err
+static int emu_make(vka_shader *s, const dmsh_vk_module *m, char *err, size_t errn) {
+    size_t nb = 0; uint32_t *w = vka_shlib_spirv(s->lib, m, &nb, err, errn);
+    if (!w) return 0;
+    vka_spv_mesh_info info; size_t on = 0; char e2[200];
+    uint32_t *o = vka_spv_mesh_compute(w, nb / 4, VKA_ME_REC_BINDING, VKA_ME_OUT_BINDING, &info, &on, e2, sizeof e2);
+    free(w);
+    if (!o) { snprintf(err, errn, "not made a compute shader: %s", e2); return 0; }
+    size_t ob = on * 4;
+    if (s->e->flags & (DMSH_VK_F_SUBGROUP | DMSH_VK_F_TEXFB)) single_lane(s->key, DMSH_VK_STAGE_CS, &o, &ob);
+    uint32_t smax = V.props.limits.maxComputeSharedMemorySize;
+    if (info.shared_bytes > smax) { free(o); snprintf(err, errn, "as a compute shader it takes %u bytes of workgroup memory (its task memory and outputs there), the device at most %u", info.shared_bytes, smax); return 0; }
+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = ob, .pCode = o};
+    VkShaderModule mod = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
+    free(o);
+    if (r) { snprintf(err, errn, "vkCreateShaderModule %d (as a compute shader)", r); return 0; }
+    vka_shader *vs = NULL;
+    if (!info.task) {
+        size_t vn = 0; uint32_t *v = vka_spv_mesh_vs(&info, VKA_ME_OUT_BINDING, &vn); VkShaderModule vm = VK_NULL_HANDLE;
+        VkShaderModuleCreateInfo vi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = vn * 4, .pCode = v};
+        r = v ? vk.vkCreateShaderModule(V.dev, &vi, NULL, &vm) : VK_ERROR_UNKNOWN;
+        free(v);
+        dmsh_vk_entry *ve = calloc(1, sizeof *ve); vs = calloc(1, sizeof *vs);
+        if (r || !ve || !vs) { if (vm) vk.vkDestroyShaderModule(V.dev, vm, NULL); vk.vkDestroyShaderModule(V.dev, mod, NULL); free(ve); free(vs); snprintf(err, errn, "its vertex shader not made (%d)", r); return 0; }
+        ve->key = s->key ^ 0x8000000000000000ull; ve->stage = DMSH_VK_STAGE_VS;   // (a key for the logs: the vertex shader is not in the library)
+        vs->key = ve->key; vs->e = ve; vs->b = s->b; vs->lib = s->lib; vs->mods[DMSH_VK_MOD_BASE] = vm; vs->emu = 2;
+    }
+    vka_spv_mesh_info *mi = malloc(sizeof *mi);
+    if (!mi) { vk.vkDestroyShaderModule(V.dev, mod, NULL); if (vs) { vk.vkDestroyShaderModule(V.dev, vs->mods[0], NULL); free((void *)vs->e); free(vs); } snprintf(err, errn, "out of memory"); return 0; }
+    *mi = info; s->me = mi; s->me_vs = vs; s->emu = 1; s->mods[DMSH_VK_MOD_BASE] = mod;
+    static _Atomic int n; if (atomic_fetch_add(&n, 1) < 32)
+        VLOG("%s shader %016llx: made a compute shader for mesh draws as compute (%u invocations, %u bytes of workgroup memory, task memory %u words%s)", info.task ? "task" : "mesh",
+             (unsigned long long)s->key, info.threads, info.shared_bytes, info.payload_words, info.task ? "" : "; its vertex shader draws its slots");
+    if (!info.task) { char b[200]; size_t k = 0; b[0] = 0;
+        for (uint32_t j = 0; j < info.nv && k < sizeof b; j++) k += (size_t)snprintf(b + k, sizeof b - k, " v%u", info.vloc[j]);
+        for (uint32_t j = 0; j < info.np && k < sizeof b; j++) k += (size_t)snprintf(b + k, sizeof b - k, " p%u", info.ploc[j]);
+        if (n <= 32) VLOG("mesh shader %016llx: %u vertices / %u primitives a workgroup, generic locations%s; %u bytes a workgroup's slot", (unsigned long long)s->key, info.max_v, info.max_p, b[0] ? b : " none", info.slot_vec4 * 16); }
+    return 1;
+}
 vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
     pthread_mutex_lock(&g_mu);
     shent *h = sh_find(key, L);
@@ -354,7 +420,8 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
         why = refusal(L, e);
         const dmsh_vk_module *m = why ? NULL : vka_shlib_module(L, e, DMSH_VK_MOD_BASE);
         if (!why && !m) why = "no base module";
-        if (m) s->mods[DMSH_VK_MOD_BASE] = spv_module(L, e, m, key, &why, err, sizeof err);
+        if (m && !V.mesh && (e->stage == DMSH_VK_STAGE_TS || e->stage == DMSH_VK_STAGE_MS)) { if (!emu_make(s, m, err, sizeof err)) why = err; }   // (refusal: only with vka_mesh_emu)
+        else if (m) s->mods[DMSH_VK_MOD_BASE] = spv_module(L, e, m, key, &why, err, sizeof err);
         if (!why && e->stage == DMSH_VK_STAGE_GS && VKA_ENV("DM_VK_GS_CLAIM", 1)) {   // memory writes: made once per primitive (vka_spv_gs_claim)
             char e2[256] = ""; s->gs_fx = gs_words(s, NULL, NULL, e2, sizeof e2);
             if (s->gs_fx < 0) VRED("geometry shader %016llx: memory writes not put under a claim (%s): drawn as it is, its writes repeated by the device's runs of each primitive", (unsigned long long)key, e2);
@@ -371,7 +438,11 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
     }
     pthread_mutex_lock(&g_mu);
     h = sh_find(key, L);
-    if (h) { if (s->mods[0]) vk.vkDestroyShaderModule(V.dev, s->mods[0], NULL); free(s); s = h->sh; }   // another thread made it meanwhile
+    if (h) {   // another thread made it meanwhile
+        if (s->mods[0]) vk.vkDestroyShaderModule(V.dev, s->mods[0], NULL);
+        if (s->me_vs) { vk.vkDestroyShaderModule(V.dev, s->me_vs->mods[0], NULL); free((void *)s->me_vs->e); free(s->me_vs); }
+        free(s->me); free(s); s = h->sh;
+    }
     else sh_put(key, L, s);
     pthread_mutex_unlock(&g_mu);
     return s->bad ? NULL : s;
