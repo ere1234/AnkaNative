@@ -249,6 +249,32 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
     uint64_t hi = alias_run_end(p, g_alias_cap >> 12, *mapped);
     *base = (uintptr_t)g_alias + (lo << 12); *size = (hi - lo) << 12;
 }
+// Host mappings by place, permissions and backing, the 12 most numerous: logged once when mprotect / mmap run out of mappings (ENOMEM)
+static int maps_summary(void) {
+    struct { char k[96]; int n; } t[96]; int nt = 0, total = 0, other = 0;
+    FILE *fm = fopen("/proc/self/maps", "r"); if (!fm) return -1;
+    char line[512];
+    uintptr_t as = (uintptr_t)g_as, al = (uintptr_t)g_alias, ae = al + g_alias_cap, hb = (uintptr_t)g_heap, he = hb + g_heap_cap;
+    while (fgets(line, sizeof line, fm)) {
+        unsigned long lo, hi; char perm[8] = "", path[256] = ""; int nf = sscanf(line, "%lx-%lx %7s %*s %*s %*s %255[^\n]", &lo, &hi, perm, path); total++;
+        if (nf < 3) continue;
+        const char *where = lo >= al && lo < ae ? "alias" : lo >= hb && lo < he ? "heap" : lo >= as && lo < as + RESERVE ? "guest" : "host";
+        const char *b = strrchr(path, '/'); b = b ? b + 1 : path[0] ? path : "anon";
+        char k[96]; snprintf(k, sizeof k, "%s %s %.60s", where, perm, b);
+        int i = 0; while (i < nt && strcmp(t[i].k, k)) i++;
+        if (i == nt) { if (nt == 96) { other++; continue; } snprintf(t[nt].k, sizeof t[nt].k, "%s", k); t[nt++].n = 0; }
+        t[i].n++;
+    }
+    fclose(fm);
+    char out[1400]; int o = snprintf(out, sizeof out, "[mem] host mappings %d by place / permissions / backing:", total);
+    for (int r = 0; r < 12 && o < (int)sizeof out - 1; r++) {
+        int m = -1; for (int i = 0; i < nt; i++) if (t[i].n && (m < 0 || t[i].n > t[m].n)) m = i;
+        if (m < 0) break;
+        o += snprintf(out + o, sizeof out - o, " %s %d;", t[m].k, t[m].n); t[m].n = 0;
+    }
+    LOG("%s (+%d lines past the table)", out, other);
+    return total;
+}
 // Give guest memory back to the system: a fresh inaccessible mapping over [lo, hi), whole host pages. mprotect(PROT_NONE) alone keeps every page resident and dirty, only
 // out of phys_footprint, and madvise(MADV_FREE) does nothing to pages that are not writable, though it returns 0 (1 GiB on the Mac: 1,024 MiB still resident and dirty; this: 0).
 // A memory pool's no-copy buffer over the range keeps the old pages for the GPU work still using it until the buffer goes. Returns 1 when the range now holds zero pages;
@@ -257,7 +283,11 @@ static int guest_release(uintptr_t lo, uintptr_t hi) {
     if (dm_gfx_guest_release(lo, hi)) return 1;
     if (mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) != MAP_FAILED) return 1;
     static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) LOG("[RED] guest memory %#lx+%#lx not given back (errno %d): it stays resident", (unsigned long)lo, (unsigned long)(hi - lo), errno);
-    if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
+    if (mprotect((void *)lo, hi - lo, PROT_NONE)) {
+        // second ootr abort (~21 min, 66k mappings): left accessible with its old bytes, alias_initialize clears them on the next map
+        if (errno == ENOMEM) { static _Atomic int nm; if (!atomic_fetch_add(&nm, 1)) maps_summary(); return 0; }
+        die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
+    }
     return 0;
 }
 // Initialize holes using the OLD commit bitmap. Fresh anonymous host pages stay
@@ -999,11 +1029,8 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
                     // ootr on android aborted here after ~12 min (errno 12): refused like a full pool, the sdk drops cached pages and retries. cause open: likely vm.max_map_count
                     if (e == ENOMEM) {
                         pthread_mutex_unlock(&g_map_lock);
-                        static _Atomic int nnm; if (atomic_fetch_add(&nnm, 1) < 8) {
-                            int nmaps = -1; FILE *fm = fopen("/proc/self/maps", "r");
-                            if (fm) { nmaps = 0; for (int c; (c = fgetc(fm)) != EOF;) nmaps += c == '\n'; fclose(fm); }
-                            LOG("[RED] [mem] MapPhysicalMemory %p+%#zx: mprotect ENOMEM with %d host mappings, refused (ResultLimitReached)", (void *)a, size, nmaps);
-                        }
+                        static _Atomic int nnm; int k = atomic_fetch_add(&nnm, 1);
+                        if (k < 8) LOG("[RED] [mem] MapPhysicalMemory %p+%#zx: mprotect ENOMEM with %d host mappings, refused (ResultLimitReached)", (void *)a, size, k ? -1 : maps_summary());
                         regs[0] = 0x10801; return 0;
                     }
                     die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, e);
