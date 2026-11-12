@@ -165,6 +165,7 @@ static struct {
     int bar_pending;                                     // a game barrier came inside the pass and was taken there (vka_rp_game_barrier): the draws after it are checked (bar_hazard)
     vka_img *wim[9]; int8_t wslot[9]; int nw;            // its watched big attachments (DM_VK_RTWATCH_MB, vka_tex.c "Big targets"): colour index, or -1 depth / stencil
 } R;
+static void bcrt_flush(void);   // (below: the shadows of compressed targets back into them, at the pass's end)
 // Clears waiting for the pass of their targets (vka_rp_clear), in order: the next draw over the same targets opens its pass with them (loadOp CLEAR, or vkCmdClearAttachments),
 // anything else does them outside a pass first (pc_flush), as before
 enum { NPC = 16 };
@@ -192,6 +193,7 @@ void vka_rp_end(void) {
     if (vka_gp_split) vka_gp_rp_end(g_cb);   // DM_VK_GPUPROF_SPLIT: the split pass's last timestamp, inside it
     vk.vkCmdEndRendering(g_cb);
     vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
+    bcrt_flush();
     R.on = 0; vka_tex_feedback(NULL, NULL, 0);
     if (vka_nan_on()) vka_nan_pass(g_cb, R.cim, R.clv, R.cl0, R.nci);
 }
@@ -202,6 +204,65 @@ static void rt_range(const vka_img *im, const view_t *v, int has_v, uint32_t *lv
     uint32_t all = vka_img_slices(im, *lv);
     *nl = has_v && v->set_layers && v->nlayers ? v->nlayers : all - (*l0 < all ? *l0 : 0);
     if (*l0 + *nl > all) *nl = *l0 < all ? all - *l0 : 0;
+}
+// A BC texture drawn into through an uncompressed view of one block per pixel (a GPU block encoder, e.g. agl's BC4 encoder through RGBA16UI): Vulkan cannot attach a compressed
+// image, so the pass draws into a shadow of blocks x blocks in the view's format, copied in from the level / layer / depth plane before the pass and back after it
+// (vkCmdCopyImage between size-compatible compressed and uncompressed formats). The Metal path does the same (nvn_mtl.m bcrt_attach, rendering.md)
+typedef struct { VkImage img; VkDeviceMemory dm; VkImageView v; VkFormat fmt; uint32_t w, h; int busy; } bcrt_sh;
+enum { NBCSH = 32 };
+static bcrt_sh g_bcsh[NBCSH];
+static struct { vka_img *im; bcrt_sh *sh; uint32_t lv, layer, z, w, h; } g_bcrt[8]; static int g_nbcrt;
+static bcrt_sh *bcrt_shadow(VkFormat fmt, uint32_t w, uint32_t h) {
+    bcrt_sh *fr = NULL;
+    for (int i = 0; i < NBCSH; i++) { bcrt_sh *s = &g_bcsh[i]; if (s->busy) continue; if (s->img && s->fmt == fmt && s->w == w && s->h == h) return s; if (!s->img && !fr) fr = s; }
+    if (!fr) { VRED_ONCE("compressed render target: all %d shadows in use or made, %ux%u VkFormat %d not drawn", NBCSH, w, h, fmt); return NULL; }   // kept, never freed: few and small
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VkResult r = vk.vkCreateImage(V.dev, &ci, NULL, &fr->img);
+    VkMemoryRequirements mr = {0}; if (!r) vk.vkGetImageMemoryRequirements(V.dev, fr->img, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
+    if (!r && ai.memoryTypeIndex == UINT32_MAX) r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!r) r = vk.vkAllocateMemory(V.dev, &ai, NULL, &fr->dm);
+    if (!r) r = vk.vkBindImageMemory(V.dev, fr->img, fr->dm, 0);
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = fr->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (!r) r = vk.vkCreateImageView(V.dev, &vi, NULL, &fr->v);
+    if (r) {
+        VRED_ONCE("compressed render target: shadow %ux%u VkFormat %d: %d", w, h, fmt, r);
+        if (fr->v) vk.vkDestroyImageView(V.dev, fr->v, NULL); if (fr->img) vk.vkDestroyImage(V.dev, fr->img, NULL); if (fr->dm) vk.vkFreeMemory(V.dev, fr->dm, NULL);
+        *fr = (bcrt_sh){0}; return NULL;
+    }
+    // it starts UNDEFINED: GENERAL like every other image of the replay
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = fr->img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    fr->fmt = fmt; fr->w = w; fr->h = h;
+    return fr;
+}
+static void bcrt_copy(VkImage src, uint32_t slv, uint32_t sl, uint32_t sz, VkImage dst, uint32_t dlv, uint32_t dl, uint32_t dz, uint32_t w, uint32_t h) {   // w x h in the source's texels
+    VkImageCopy c = {{VK_IMAGE_ASPECT_COLOR_BIT, slv, sl, 1}, {0, 0, (int32_t)sz}, {VK_IMAGE_ASPECT_COLOR_BIT, dlv, dl, 1}, {0, 0, (int32_t)dz}, {w, h, 1}};
+    vk.vkCmdCopyImage(g_cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+}
+// After the pass: the shadows' blocks back into their BC textures
+static void bcrt_flush(void) {
+    int n = g_nbcrt; g_nbcrt = 0; if (!n) return;
+    for (int i = 0; i < n; i++) {
+        bcrt_copy(g_bcrt[i].sh->img, 0, 0, 0, g_bcrt[i].im->img, g_bcrt[i].lv, g_bcrt[i].layer, g_bcrt[i].z, g_bcrt[i].sh->w, g_bcrt[i].sh->h);
+        g_bcrt[i].sh->busy = 0;
+    }
+    vka_barrier(g_cb);
+}
+// The view for colour slot i when its image is BC and its view format an uncompressed colour one of the block's size: the shadow's (copied in here, outside a pass); VK_NULL_HANDLE otherwise
+static VkImageView bcrt_attach(vka_img *im, const vka_fmt *f, uint32_t lv, uint32_t l0, uint32_t nl, uint32_t *ow, uint32_t *oh) {
+    if (f->kind >= 3 || f->bw != 1 || f->bh != 1 || !(im->f.bw > 1 || im->f.bh > 1) || f->bpb != im->f.bpb || nl != 1 || g_nbcrt >= 8) return VK_NULL_HANDLE;
+    uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, bw = (w + im->f.bw - 1) / im->f.bw, bh = (h + im->f.bh - 1) / im->f.bh;
+    bcrt_sh *sh = bcrt_shadow(f->view, bw, bh); if (!sh) return VK_NULL_HANDLE;
+    int is3d = im->depth > 1; uint32_t layer = is3d ? 0 : l0, z = is3d ? l0 : 0;
+    vka_barrier(g_cb);   // what was written into the texture before, then into the shadow
+    bcrt_copy(im->img, lv, layer, z, sh->img, 0, 0, 0, w, h);
+    vka_barrier(g_cb);
+    sh->busy = 1; g_bcrt[g_nbcrt].im = im; g_bcrt[g_nbcrt].sh = sh; g_bcrt[g_nbcrt].lv = lv; g_bcrt[g_nbcrt].layer = layer; g_bcrt[g_nbcrt].z = z; g_bcrt[g_nbcrt].w = w; g_bcrt[g_nbcrt++].h = h;
+    static int once; if (!once++) VLOG("render target in a compressed texture (VkFormat %d %ux%u): drawn into a %ux%u shadow (VkFormat %d) and copied back after the pass", im->f.vk, w, h, bw, bh, f->view);
+    *ow = bw; *oh = bh; return sh->v;
 }
 // Opens the pass over the bound targets: 0 = it cannot (no target can be an attachment), logged
 static int rp_begin(const p_set_rt *rt, int has_rt, const vka_dstate *d) {
@@ -218,7 +279,20 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const vka_dstate *d) {
         const tex_t *t = rt->color[i]; if (!t) continue;
         vka_rl_site = VKA_RL_ATT; vka_img *im = vka_tex_get(t, g_cb); vka_rl_site = 0; vka_fmt f;   // (vka_rl_site: DM_VK_RTLOG_MB's path)
         if (!im || !vka_fmt_of(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : t->d.format, &f)) continue;
-        if (!(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || f.kind >= 3) { VRED_ONCE("colour target %d (format %#x) cannot be a Vulkan colour attachment: not drawn into", i, t->d.format); continue; }
+        if (!(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || f.kind >= 3) {
+            // a BC target through a block-sized view: a shadow (bcrt_attach); Ocarina of Time's ground went black while this pass was dropped
+            uint32_t lv, l0, nl, sw, shh; VkImageView sv = VK_NULL_HANDLE;
+            if (f.kind < 3 && (im->f.bw > 1 || im->f.bh > 1)) {
+                vka_tex_whole(im, g_cb); rt_range(im, &rt->cview[i], rt->has_cview[i], &lv, &l0, &nl);
+                if (lv < im->levels && nl) { vka_tex_own(im, g_cb); sv = bcrt_attach(im, &f, lv, l0, nl, &sw, &shh); }
+            }
+            if (!sv) { VRED_ONCE("colour target %d (format %#x, view %#x) cannot be a Vulkan colour attachment: not drawn into", i, t->d.format, rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : 0); continue; }
+            ca[i].imageView = sv; R.cf[i] = f.view; R.ckind[i] = f.kind;
+            R.cnl[i] = 1; R.cext[i] = (VkExtent2D){sw, shh};
+            if (sw < w) w = sw; if (shh < h) h = shh; if (1 < layers) layers = 1;
+            vka_img_written(im);
+            continue;
+        }
         if (im->depth > 1 && !(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) continue;   // its slices are drawn into through 2D-array views (img_create)
         vka_tex_whole(im, g_cb);   // (a coarse-first image made without its finer levels: whole before rt_range maps the level, vka_tex.c "Coarse-first")
         uint32_t lv, l0, nl; rt_range(im, &rt->cview[i], rt->has_cview[i], &lv, &l0, &nl);
