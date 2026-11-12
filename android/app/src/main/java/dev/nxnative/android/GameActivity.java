@@ -447,7 +447,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             List<String> user = new ArrayList<>(guard(userEnv(new File(files, "env.txt")), "env.txt", false));   // diagnostic switches (every game: never DM_SAVE) (DM_SVC=1, DM_FS=1, ...), as the iPhone's Documents/env.txt
             user.addAll(guard(envLines(Prefs.gameEnv(this, id)), "the game's settings", false));   // the game's own lines (its Game settings): after env.txt, so they win for this game
             user.addAll(guard(userEnv(new File(files, "env-" + id + ".txt")), "env-" + id + ".txt", testApp()));   // and env-<title ID>.txt (adb), the same for one game
-            File save = saveDir(files, game, id), temp = mkdirs(new File(files, "temp/" + id)), root = mkdirs(new File(files, "root"));
+            File save = saveDir(files, game, id), temp = tempDir(files, id), root = mkdirs(new File(files, "root"));
             File aoc = aocLinks(mkdirs(new File(files, "aoc/" + id)), game, pack);
             log = new File(LogProvider.dir(this), id + "-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date()) + ".log");
             pruneLogs(id);
@@ -611,6 +611,24 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private static File mkdirs(File d) throws IOException {
         if (!d.isDirectory() && !d.mkdirs()) throw new IOException("cannot create " + d);
         return d;
+    }
+
+    /**
+     * A game's DM_TEMP (the pipeline cache, the prewarm list and the learned view formats: what makes the next run start warm) in the app's internal files
+     * (getFilesDir), which a storage cleaner or a file manager does not reach. It was files/temp/&lt;id&gt; on shared storage, and on the Galaxy S24+ that folder was
+     * empty at the first run of each new build while the saves and the pack beside it stayed (2026-11-13): every such run made its 1,200 pipelines again (85 s of
+     * compiling, frames of 2-4 s). The older folder's files are moved in once, when the new one is made
+     */
+    private File tempDir(File files, String id) throws IOException {
+        File t = new File(getFilesDir(), "temp/" + id), old = new File(files, "temp/" + id);
+        boolean fresh = !t.isDirectory();
+        mkdirs(t);
+        File[] l = fresh && !old.getAbsoluteFile().equals(t.getAbsoluteFile()) ? old.listFiles() : null;
+        if (l != null) for (File f : l) {
+            if (!f.isFile() || f.getName().endsWith(".tmp")) continue;   // (a save that stopped part way)
+            try { Files.copy(f.toPath(), new File(t, f.getName()).toPath()); f.delete(); } catch (IOException | RuntimeException e) { /* left there: this file starts empty */ }
+        }
+        return t;
     }
 
     /** DM_AOC_DIR/<index> → each DLC's RomFS folder in the game folder, or DM_AOC_DIR/<index>.nup → the .nup (hle_fs.c aoc_dir; Pack.aocLinks), as symbolic links in app storage */

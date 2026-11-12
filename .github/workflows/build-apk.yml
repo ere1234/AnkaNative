@@ -1,6 +1,7 @@
 # Builds the play app (dev.ankanative.android.play, "Anka Native") for Ocarina of Time on GitHub's runners, for a phone-only setup: the on-device
 # packer's stage (android/ondevice/build.sh), then the APK (android/README.md "Build the APK"). It installs beside the official app. Signed with
-# .github/ci/debug.keystore.b64, a fixed debug key, so each build installs over the last one and keeps its data.
+# .github/ci/debug.keystore.b64, a fixed debug key, so each build installs over the last one and keeps its data. Its version code rises with each run (1000 + the
+# run number), so a newer build is an upgrade to the installer: every build had 5, and on the Galaxy S24+ one would not install over another
 name: build-apk
 
 on:
@@ -43,7 +44,7 @@ jobs:
         run: bash android/ondevice/build.sh "$RUNNER_TEMP/ondevice" all
       - name: APK
         working-directory: android/app
-        run: ./gradlew --no-daemon -PnxPackStage="$RUNNER_TEMP/ondevice/stage" -PnxGames=0400486024DEC000 -PnxPlay=true apk
+        run: ./gradlew --no-daemon -PnxPackStage="$RUNNER_TEMP/ondevice/stage" -PnxGames=0400486024DEC000 -PnxPlay=true -PnxVersionCode=$((1000 + GITHUB_RUN_NUMBER)) apk
       - name: Sign with the fixed key
         run: |
           AS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner

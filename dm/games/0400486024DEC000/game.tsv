@@ -102,7 +102,13 @@ tex_dirty_upload	on
 # DM_VK_PRESS_OFF_MB=64: the IDs the feedback gate held back are made at most 64 MiB a frame once it turns off (the aa run's two ends made 4.4k textures, 640 MB, in a 2.5 s frame).
 # DM_VK_NDSR_STANDIN_AA=1: the NDSR stand-in reads the image the game's AA blend (a335c1db6270c355) wrote in this frame, and logs whether that is its input (session-2026-11-07
 # aa/WIRE.md). DM_VK_LOD_BIAS_MIN stays off here: the phone run A/Bs it
-host_env	DM_VK_PLACE_PART_MB=64 DM_VK_PSO_ASYNC=2 DM_VK_NDSR_STANDIN=1 DM_VK_SCRATCH_IDLE_MB=16 DM_VK_UPLOAD_INFLIGHT_MB=64 DM_VK_MIPDROP=1 DM_VK_SCAN_COARSE=1 DM_VK_TEXFB=2 DM_VK_PRESS_RATE=1 DM_VK_ZSHARE_ADOPT=1 DM_VK_ZSHARE_ZCLEAR=1 DM_VK_RTWATCH_MB=32 DM_VK_RTALIAS=1 DM_VK_RTALIAS_MB=1 DM_MEM_FOOT=1 DM_VK_PLACE_SHADER_POOLS=0 DM_VK_SHPOOL_LOG=1 DM_MEM_FILEBACK=1 DM_MEM_FILEBACK_KINDS=shader DM_VK_GMEM_PIDX_BUFS=2 DM_FSTEP_LOG_S=10 DM_VK_PCACHE_MIN_S=120 DM_VK_PSO_TRY=2 DM_VK_TEXFB_IDLE_S=30 DM_VK_TEXFB_REPORT_MB=128 DM_VK_MIPDROP_RESTORE_MB=32 DM_VK_PRESS_HYST_MB=256 DM_VK_PRESS_OFF_MB=64 DM_VK_NDSR_STANDIN_AA=1
+# DM_VK_TEXFB=3 (2 before, 2026-11-13): the gate always, not only under memory pressure. On the Galaxy S24+ (18 minutes, session log 232136) the gate turned off at each
+# pressure end, and within a second the next scans made every ID they named: 2,246-3,329 textures (533-649 MB of uploads) in frames of 2.1-3.1 s, which turned the pressure
+# on again, about once a minute. Of the 49,473 scan-named images made in that run the GPU indexed 2,163 (4 %) within 2 s; of the 56,296 IDs the gate held back it asked
+# for 69 later (one submission on the placeholder each)
+# DM_VK_BAR_KEEP=1: the game's barriers inside a draw pass (about 79 a frame in handheld gameplay) are taken inside it when no draw of the pass wrote memory, instead of ending
+# the pass and a full barrier at each: 78 of 79 taken, about 100 fewer full barriers a frame, the picture as before (Galaxy S24+, RADV, 2026-11-13)
+host_env	DM_VK_PLACE_PART_MB=64 DM_VK_PSO_ASYNC=2 DM_VK_NDSR_STANDIN=1 DM_VK_SCRATCH_IDLE_MB=16 DM_VK_UPLOAD_INFLIGHT_MB=64 DM_VK_MIPDROP=1 DM_VK_SCAN_COARSE=1 DM_VK_TEXFB=3 DM_VK_PRESS_RATE=1 DM_VK_ZSHARE_ADOPT=1 DM_VK_ZSHARE_ZCLEAR=1 DM_VK_RTWATCH_MB=32 DM_VK_RTALIAS=1 DM_VK_RTALIAS_MB=1 DM_MEM_FOOT=1 DM_VK_PLACE_SHADER_POOLS=0 DM_VK_SHPOOL_LOG=1 DM_MEM_FILEBACK=1 DM_MEM_FILEBACK_KINDS=shader DM_VK_GMEM_PIDX_BUFS=2 DM_FSTEP_LOG_S=10 DM_VK_PCACHE_MIN_S=120 DM_VK_PSO_TRY=2 DM_VK_TEXFB_IDLE_S=30 DM_VK_TEXFB_REPORT_MB=128 DM_VK_MIPDROP_RESTORE_MB=32 DM_VK_PRESS_HYST_MB=256 DM_VK_PRESS_OFF_MB=64 DM_VK_NDSR_STANDIN_AA=1 DM_VK_BAR_KEEP=1
 
 # ---- Test runs ----
 # DM_SKIP's intro skip (android/TESTING.md, Intro skip) turns itself off at gameplay: the opening and title movies draw 2-16 draws a frame, the new-game movie 2-6, the first

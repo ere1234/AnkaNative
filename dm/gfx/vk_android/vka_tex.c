@@ -357,15 +357,20 @@ static void vl_load(void) {   // caller holds g_vlmu
                                dropped ? "; dropped lines that are not a pair of uncompressed colour formats of one texel size, duplicates and those past 4 for one format and size (the file is written again without them)" : "");
     if (dropped) vl_save();
 }
-// rt: a render target (NVN's COMPRESSIBLE or IMAGE flag). One with no pair learned at its size takes the pairs of its format learned at any size: a dynamic-resolution
-// target met at a new size drew its first images there through the fallback (Ocarina of Time: 1195x672 and 1024x576 after 1440x810 in one run, each size's R32_UINT views
-// in the target's own format until its images were made again). Sampled textures (no such flag) keep the exact size, so their lists (and Adreno's UBWC) are untouched
+// rt: a render target (NVN's COMPRESSIBLE or IMAGE flag). One with no pair learned at its size takes the pairs of its format learned at another size of its shape (the
+// same width to height within 1 %: a dynamic-resolution family): such a target met at a new size drew its first images there through the fallback (Ocarina of Time:
+// 1195x672 and 1024x576 after 1440x810 in one run, each size's R32_UINT views in the target's own format until its images were made again). Sampled textures (no such
+// flag) and targets of other shapes keep the exact size, so their lists (and Adreno's UBWC, RADV's DCC) are untouched
+static int vl_same_shape(uint32_t w, uint32_t h, uint32_t w2, uint32_t h2) { uint64_t x = (uint64_t)w * h2, y = (uint64_t)w2 * h, d = x > y ? x - y : y - x; return d * 100 <= (x > y ? x : y); }
 static int vl_formats(VkFormat a, uint32_t w, uint32_t h, int rt, VkFormat *out, int max) {   // caller holds g_vlmu
     if (!VKA_ENV("DM_VK_VIEW_LEARN", 1)) return 0;
     vl_load(); int n = 0;
     for (int any = 0; any < 2 && !n; any++) {
         if (any && !(rt && VKA_ENV("DM_VK_VIEW_LEARN_RT", 1))) break;
-        for (int i = 0; i < g_nvl && n < max; i++) if (g_vl[i].a == a && (any || (g_vl[i].w == w && g_vl[i].h == h))) { int dup = 0; for (int k = 0; k < n; k++) dup |= out[k] == g_vl[i].b; if (!dup) out[n++] = g_vl[i].b; }   // (vl_learn and vl_load keep at most VL_PER_IMAGE a format and size)
+        for (int i = 0; i < g_nvl && n < max; i++) if (g_vl[i].a == a && (any ? vl_same_shape(w, h, g_vl[i].w, g_vl[i].h) : g_vl[i].w == w && g_vl[i].h == h)) {
+            int dup = 0; for (int k = 0; k < n; k++) dup |= out[k] == g_vl[i].b;
+            if (!dup) out[n++] = g_vl[i].b;   // (vl_learn and vl_load keep at most VL_PER_IMAGE a format and size)
+        }
     }
     return n;
 }
