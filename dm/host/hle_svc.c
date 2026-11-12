@@ -994,8 +994,20 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (changed && mhi > mlo) {
             if (commit) {
                 dm_gfx_guest_open((void *)mlo, mhi - mlo);
-                if (mprotect((void *)mlo, mhi - mlo, PROT_READ | PROT_WRITE))
-                    die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, errno);
+                if (mprotect((void *)mlo, mhi - mlo, PROT_READ | PROT_WRITE)) {
+                    int e = errno;
+                    // ootr on android aborted here after ~12 min (errno 12): refused like a full pool, the sdk drops cached pages and retries. cause open: likely vm.max_map_count
+                    if (e == ENOMEM) {
+                        pthread_mutex_unlock(&g_map_lock);
+                        static _Atomic int nnm; if (atomic_fetch_add(&nnm, 1) < 8) {
+                            int nmaps = -1; FILE *fm = fopen("/proc/self/maps", "r");
+                            if (fm) { nmaps = 0; for (int c; (c = fgetc(fm)) != EOF;) nmaps += c == '\n'; fclose(fm); }
+                            LOG("[RED] [mem] MapPhysicalMemory %p+%#zx: mprotect ENOMEM with %d host mappings, refused (ResultLimitReached)", (void *)a, size, nmaps);
+                        }
+                        regs[0] = 0x10801; return 0;
+                    }
+                    die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, e);
+                }
                 dm_guest_write_prepare((void *)mlo, mhi - mlo);
             } else {
                 // the bits go first: a host reader (dm_guest_read_mapped) that finds a page mapped must not find it inaccessible
