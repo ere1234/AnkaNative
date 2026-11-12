@@ -266,7 +266,7 @@ static void unref_locked(vka_img *im) {
 // the next runs from their first use, take it and are shared. Shared without the format, its views fell back to the image's format (vka_view): DKB's R11G11B10 HDR target
 // over an RGBA8 texture's memory was drawn and sampled as RGBA8 UNORM, and a colour attachment view in another format than the pipeline's rendering format breaks a valid
 // usage rule. The split loses a bit-for-bit reinterpretation between the two formats through the memory in that run, which the format list never allowed anyway; it stays
-// for the run without DM_TEMP's file, once the table is full, or under DM_VK_VIEW_LEARN=0. Not compressed textures of another format: a view takes only a format of the image's own compatibility class (BC1 and BC4 blocks have one size, as BC3, BC5, BC7 and ASTC 4x4 blocks have, but no view
+// for the run without DM_TEMP's file, past 4 learned formats for one image format and size, or under DM_VK_VIEW_LEARN=0. Not compressed textures of another format: a view takes only a format of the image's own compatibility class (BC1 and BC4 blocks have one size, as BC3, BC5, BC7 and ASTC 4x4 blocks have, but no view
 // reinterprets one as the other), and view learning takes uncompressed pairs only, so a BC4 texture over a BC1 image's memory was sampled through the BC1 view: garbage.
 // Such a texture gets its own image, filled from its own storage; what it loses is GPU content passing between the two through the memory, which compressed textures
 // (never render targets) do not have
@@ -305,7 +305,11 @@ static int same_shape(const vka_img *a, const tex_t *t, const vka_fmt *f, int le
 // it while E5B9G9R9 in the list drops it; older Adreno keep it only for lists of one UBWC compatibility class. The pairs are kept in $DM_TEMP/vk_view_formats.txt, so the next run makes
 // the image right from its first use. Meanwhile the texture gets its own image (same_shape), and a view keeps the fallback to the image's own format ([RED]) for the life
 // of an image made before the pair was learned (its views are in use; replacing it would mean rebinding every view and descriptor); so it stays in a run without DM_TEMP,
-// once the table is full (64 pairs) or with 4 formats learned for that image format and size (VL_PER_IMAGE).
+// or with 4 formats learned for that image format and size (VL_PER_IMAGE).
+// The table holds NVL pairs, and a full one drops its oldest pair for each new one. It held 64 and refused every pair past them for good: a game with dynamic resolution
+// makes its targets at each size it steps through, each size with its own pairs (Ocarina of Time in handheld mode: 1440x810, 1120x630, 960x540, 854x480, ... with
+// RGBA8, B10G11R11 and E5B9G9R9 as R32_UINT, B10G11R11 as E5B9G9R9 and RGBA8, about 7 pairs a size), and once a few runs had filled it, the sizes left out drew their
+// R32_UINT words into the targets' own formats in every run (black, pink and broken pictures)
 // A pair is taken (learned, or read from the file) only when both formats are uncompressed colour formats of one texel size, float, normalized or integer (kinds 0-2;
 // Vulkan's compatibility classes of uncompressed colour formats are by texel size, so R32_UINT is in B10G11R11's and RGBA8's 32-bit class): a format list may hold only
 // formats compatible with the image's, and a bad pair in the file (an older build's, a hand edit) would break that rule on every image of its format in every run. Integer
@@ -314,7 +318,7 @@ static int same_shape(const vka_img *a, const tex_t *t, const vka_fmt *f, int le
 // written whole (a temporary file renamed over it), so a run that ends while writing leaves the old one. DM_VK_VIEW_LEARN=0: nothing learned or read (views in the image's
 // own format, as before)
 typedef struct { VkFormat a, b; uint32_t w, h; } vlearn;
-enum { NVL = 64 };
+enum { NVL = 512 };   // (oldest first: the file keeps the order they were learned in)
 static vlearn g_vl[NVL]; static int g_nvl, g_vl_loaded; static char g_vl_path[1024]; static pthread_mutex_t g_vlmu = PTHREAD_MUTEX_INITIALIZER;
 enum { VL_PER_IMAGE = 4 };   // learned formats one image takes at most (vka_img.xfmt)   // under g_vlmu
 static int vl_bytes(VkFormat v) {   // bytes per texel of an uncompressed colour (kind 0-2: float, normalized or integer) format of the textures (an image's own format or its sRGB view format), else 0
@@ -364,9 +368,14 @@ static int vl_learn(VkFormat a, VkFormat b, uint32_t w, uint32_t h) {   // calle
     vl_load();
     int same = 0;
     for (int i = 0; i < g_nvl; i++) { if (g_vl[i].a == a && g_vl[i].b == b && g_vl[i].w == w && g_vl[i].h == h) return 0; same += g_vl[i].a == a && g_vl[i].w == w && g_vl[i].h == h; }
-    if (g_nvl == NVL || same >= VL_PER_IMAGE) {
-        static int nr; if (nr++ < 4) VRED("learned view formats: VkFormat %d as a view of VkFormat %d (%ux%u) not learned: %s", b, a, w, h, same >= VL_PER_IMAGE ? "that image format and size has 4 already" : "the table is full (64 pairs)");
+    if (same >= VL_PER_IMAGE) {
+        static int nr; if (nr++ < 4) VRED("learned view formats: VkFormat %d as a view of VkFormat %d (%ux%u) not learned: that image format and size has 4 already", b, a, w, h);
         return 0;
+    }
+    if (g_nvl == NVL) {   // full: the oldest pair goes (images made with it keep it; the next run learns it again if it is still asked for)
+        static int nl; if (!nl++) VLOG("learned view formats: the table is full (%d pairs): the oldest pair (VkFormat %d as VkFormat %d, %ux%u) dropped for VkFormat %d as VkFormat %d (%ux%u); each new pair drops the oldest from now on",
+                                       NVL, g_vl[0].a, g_vl[0].b, g_vl[0].w, g_vl[0].h, a, b, w, h);
+        memmove(&g_vl[0], &g_vl[1], (size_t)(NVL - 1) * sizeof *g_vl); g_nvl--;
     }
     g_vl[g_nvl++] = (vlearn){a, b, w, h};
     vl_save();
@@ -2176,7 +2185,7 @@ static void view_unlisted(const vka_img *im, VkFormat fmt, const char *then) {
         while (k < ns && !(seen[k].a == im->f.vk && seen[k].b == fmt)) k++;
         if (k == ns && ns < 32) { seen[ns].a = im->f.vk; seen[ns++].b = fmt;
             VRED("image VkFormat %d (NVN %#x, %ux%u) asked for a view as VkFormat %d, which its format list does not have: %s%s", im->f.vk, im->d.format, im->w, im->h, fmt, then,
-                 VKA_ENV("DM_VK_VIEW_LEARN", 1) ? " (an image made before the pair was learned, or the table is full)" : " (DM_VK_VIEW_LEARN=0)"); } }
+                 VKA_ENV("DM_VK_VIEW_LEARN", 1) ? " (an image made before the pair was learned, or 4 formats learned for its format and size already)" : " (DM_VK_VIEW_LEARN=0)"); } }
 }
 // The usage a view in format f takes of an image made with usage u: each use whose format feature f lacks left out (a view in another format than the image's has the
 // view format's features: VUID-VkImageViewCreateInfo-usage-02274 to 02277). An sRGB view of an image with storage use leaves storage out (sRGB formats have no storage
@@ -2646,7 +2655,7 @@ static int img_remake(vka_img *im, VkCommandBuffer cb, VkFormat want) {
     if (!(n->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {   // the format's image limits refuse storage at this shape
         VRED("texture serial %llu %ux%u VkFormat %d: bound as a shader image, but the driver has no storage use for it at this shape: its writes go nowhere", (unsigned long long)im->serial, im->w, im->h, im->f.vk);
         g_img_bytes -= n->bytes; img_destroy(n); im->no_storage = 1; return 0; }
-    if (want && !img_lists(n, want)) { g_img_bytes -= n->bytes; img_destroy(n); return 0; }   // (not learned: table full, VL_PER_IMAGE, DM_VK_VIEW_LEARN=0 or DM_VK_UBWC=0)
+    if (want && !img_lists(n, want)) { g_img_bytes -= n->bytes; img_destroy(n); return 0; }   // (not learned: VL_PER_IMAGE, DM_VK_VIEW_LEARN=0 or DM_VK_UBWC=0)
     vka_img_barrier(cb, n->img, im->aspect, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     VkImageCopy c[16]; uint32_t nc = 0;
     for (uint32_t lv = 0; lv < im->levels && nc < 16; lv++) {
@@ -2807,7 +2816,7 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     if (rf) {
         pthread_mutex_lock(&g_tmu);
         if (!img_lists(im, rf)) { view_unlisted(im, rf, ali ? "the image is remade with it in its format list" : "the binding reads as unbound");
-            // (only a pair the table now holds: one vl_learn refused (another texel size, the table full, VL_PER_IMAGE) made and dropped an image at every binding, and its
+            // (only a pair the table now holds: one vl_learn refused (another texel size, VL_PER_IMAGE) made and dropped an image at every binding, and its
             // relist ended the render pass at every draw)
             int lt = 0; if (ali && !VKA_ENV("DM_VK_UBWC", 1)) lt = 1;
             else if (ali) { VkFormat x[VL_PER_IMAGE]; pthread_mutex_lock(&g_vlmu); int nx = vl_formats(im->f.vk, im->w, im->h, x, VL_PER_IMAGE); pthread_mutex_unlock(&g_vlmu); for (int k = 0; k < nx; k++) lt |= x[k] == rf; }

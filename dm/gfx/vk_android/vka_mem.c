@@ -389,7 +389,16 @@ static VkBuffer seg_buffer(VkDeviceSize n) {
 // Granules not placed stay unbound (they read 0: strict non-resident reads); a run stops before them.
 // The first part bound is read back through both buffers once (span_check): sparse buffer binds had not run on the phone's driver before. A difference turns spans off for
 // the run. DM_VK_PLACE_SPAN=0: parts stay separate buffers (read once)
-struct span_s { VkBuffer buf; uintptr_t lo, hi; VkDeviceAddress bda; VkDeviceSize va; _Atomic int refs; };
+// A sparse buffer is bound in blocks of its memory requirements' alignment (VUID-VkSparseMemoryBind-resourceOffset-09491: offset and size multiples of it). Parts are
+// granules counted from the pool's start, so their offsets in the span are multiples of the granule (16 MiB), and so are their sizes but for a pool's last granule,
+// which ends at the pool's end (page aligned). The span was refused whole when the alignment was above the placed maps' (4 KiB): RADV on the Xclipse 940 asks 64 KiB,
+// so no pool had a span there and Ocarina of Time's buffers across two parts were skipped (`across two of its parts` [RED], 9 pools in an 18-minute run; the first a
+// 36.7 MiB buffer 0xb00 into its 146 MiB pool, over granules placed at two times). Now the span is made whenever a part can be bound into it (alignment at most the
+// granule), and a part whose offset or size is not a multiple of the alignment stays a buffer of its own (logged once): a range across it and the parts before it still
+// lies in two segments. Growing that part's memory to the next block would put driver memory under the bytes past the pool, which a whole-memory placed map (no
+// memoryMapRangePlaced, as on the Xclipse) would cover
+static uint64_t part_gran(void);
+struct span_s { VkBuffer buf; uintptr_t lo, hi; VkDeviceAddress bda; VkDeviceSize va, align; _Atomic int refs; };
 static _Atomic int g_nspan, g_nspan_parts, g_span_check;   // live spans, parts bound into them, the check: 0 not run, 2 running, 1 passed, -1 failed (spans off)
 static int span_on(void) {   // (logged once, at the first pool placed by parts; no lock held)
     static int v = -1;
@@ -420,7 +429,8 @@ static span_t *span_new(uintptr_t lo, uintptr_t hi) {
     VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, b, &mr);
     // At most a quarter of the sparse address space still free: sparse images take theirs from the same space (4 GiB on the Adreno 840's driver, where Mario Kart World's
     // arrays need it; 256 GiB on Turnip)
-    const char *why = !(mr.memoryTypeBits >> V.guest_type & 1) ? "it does not take the guest memory type" : mr.alignment > pg_align() ? "its alignment is above the placed maps'"
+    const char *why = !(mr.memoryTypeBits >> V.guest_type & 1) ? "it does not take the guest memory type"
+                    : !mr.alignment || (mr.alignment & (mr.alignment - 1)) || mr.alignment > part_gran() ? "its alignment is not a power of two up to the parts' granule (no part could be bound)"
                     : mr.size > vks_va_free() / 4 ? "it would take more than a quarter of the sparse address space left (sparse images use it too)"
                     : !vks_va_take(mr.size) ? "no sparse address space left" : NULL;
     span_t *sp = why ? NULL : calloc(1, sizeof *sp);
@@ -430,7 +440,7 @@ static span_t *span_new(uintptr_t lo, uintptr_t hi) {
                                                   mr.memoryTypeBits, (unsigned long long)mr.alignment, why);
         vk.vkDestroyBuffer(V.dev, b, NULL); return NULL;
     }
-    sp->buf = b; sp->lo = lo; sp->hi = hi; sp->va = mr.size; atomic_init(&sp->refs, 1);
+    sp->buf = b; sp->lo = lo; sp->hi = hi; sp->va = mr.size; sp->align = mr.alignment; atomic_init(&sp->refs, 1);
     VkBufferDeviceAddressInfo bai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b}; sp->bda = vk.vkGetBufferDeviceAddress(V.dev, &bai);
     int live = atomic_fetch_add(&g_nspan, 1) + 1;
     static _Atomic int nl; if (atomic_fetch_add(&nl, 1) < 8)   // (the kernel's page tables for its address space: MemAvailable before and after, to measure)
@@ -533,7 +543,10 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow, span_t *sp) {
     if (!ok) { VRED("pool memory %#lx+%#llx: placed map %d at %p", (unsigned long)lo, (unsigned long long)n, r, p); vk.vkDestroyBuffer(V.dev, s.buf, NULL); vk.vkFreeMemory(V.dev, s.mem, NULL); return 0; }
     if (V.bda) { VkBufferDeviceAddressInfo bai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = s.buf}; s.bda = vk.vkGetBufferDeviceAddress(V.dev, &bai); }
     if (sp && lo >= sp->lo && hi <= sp->hi && atomic_load(&g_span_check) >= 0) {   // a part of a pool with a span buffer: its memory bound there too (Span buffers)
-        if (vks_buf_bind(sp->buf, lo - sp->lo, n, s.mem)) { s.sp = sp; atomic_fetch_add(&sp->refs, 1); atomic_fetch_add(&g_nspan_parts, 1); }
+        if (((lo - sp->lo) | n) & (sp->align - 1)) {   // (not a whole number of the span's blocks: a pool's last part, or a gap between another pool's segments)
+            static _Atomic int nr; if (atomic_fetch_add(&nr, 1) < 4) VLOG("pool memory %#lx+%#llx: not bound into its pool's span buffer (offset %#llx there; its blocks are %llu bytes): it stays a buffer of its own",
+                                                                        (unsigned long)lo, (unsigned long long)n, (unsigned long long)(lo - sp->lo), (unsigned long long)sp->align); }
+        else if (vks_buf_bind(sp->buf, lo - sp->lo, n, s.mem)) { s.sp = sp; atomic_fetch_add(&sp->refs, 1); atomic_fetch_add(&g_nspan_parts, 1); }
         else { static _Atomic int nr; if (atomic_fetch_add(&nr, 1) < 4) VRED("pool memory %#lx+%#llx: its bind into the pool's span buffer was not queued (no memory): it stays a buffer of its own", (unsigned long)lo, (unsigned long long)n); }
     }
     if (!lock_whole()) pthread_rwlock_wrlock(&g_rw);
