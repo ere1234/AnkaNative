@@ -1007,6 +1007,15 @@ int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
     memcpy(key, k->key[st], 8);
     return 1;
 }
+// The key of stage st only when nvnProgramSetShaders could compute it (its code area in a registered pool): no hashing here, so a caller off the game's thread (the
+// Android replay's compute prefetch, mtl_prog_prefetch) never reads a code area that is not mapped yet. 0 = not known
+int prog_key_known(const prog_t *p, unsigned st, uint8_t key[8]) {
+    if (st >= p->nstage) return 0;
+    prog_keys_t *k = pk_get(p, 0);
+    if (!k || !(k->ok >> st & 1)) return 0;
+    memcpy(key, k->key[st], 8);
+    return 1;
+}
 // The Android frame replayer (vka_replay.c): a captured program's stage keys (its shader data is not in the capture)
 void nvn_prog_keys_set(const prog_t *p, const uint8_t key[6][8], uint8_t ok) { prog_keys_t *k = pk_get(p, 1); memcpy(k->key, key, sizeof k->key); k->ok = ok; }
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {

@@ -980,8 +980,29 @@ static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, 
 // A zero texel block: zeros, except ASTC, whose all-zero block is a reserved mode (the error colour): a void-extent block of colour (0, 0, 0, 0) there
 static int is_astc(VkFormat v) { return v >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && v <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; }
 static const uint8_t k_astc_zero[16] = {0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-static void astc_zero_blocks(uint8_t *p, size_t n) {   // the zeros of unmapped pages, as zero texels
-    for (size_t i = 0; i + 16 <= n; i += 16) { uint64_t a, b; memcpy(&a, p + i, 8); memcpy(&b, p + i + 8, 8); if (!(a | b)) memcpy(p + i, k_astc_zero, 16); }
+// All-zero blocks of ASTC data as zero texels: the zeros of unmapped pages, and since 2026-11-13 every upload's (see "ASTC storage that holds zeros" below). The count replaced
+static size_t astc_zero_blocks(uint8_t *p, size_t n) {
+    size_t k = 0;
+    for (size_t i = 0; i + 16 <= n; i += 16) { uint64_t a, b; memcpy(&a, p + i, 8); memcpy(&b, p + i + 8, 8); if (!(a | b)) { memcpy(p + i, k_astc_zero, 16); k++; } }
+    return k;
+}
+// ASTC storage that holds zeros (DM_VK_ASTC_ZERO, live, default 1): an all-zero 128-bit block is a reserved ASTC encoding, which a Vulkan device decodes to its error colour:
+// opaque magenta (1, 0, 1, 1) on RADV for the Xclipse 940 and on Metal, NaN on the Adreno 840. Storage the game has not filled (yet) holds such blocks: layers of an array
+// that stream in later, levels that come after the texture's first use. Ocarina of Time showed a mosaic of magenta blocks on Death Mountain's cliffs, its Goron pot tinted
+// pink and pink fringes along edges (fba4306, Galaxy S24+), where the Switch shows none; its terrain blends layers of two 90-layer 1365x1365 ASTC 8x8 material arrays
+// (serials 4003 / 4004, flags IMAGE), and a blend that picks a layer by its alpha (a height) lets an error block's alpha 1 win over the real layer. So every dense upload
+// (serial, parallel) writes such blocks as the void-extent block of colour (0, 0, 0, 0), the reading unmapped pages of sparse textures already got, after DM_VK_NANSCAN's
+// count of them. No valid encoder writes an all-zero block, so only storage holding no texture data changes. Open: what the Switch's decoder returns for such a block is not
+// measured (it draws no magenta there), and whether those blocks are empty on the Switch too or hold data a missed fill left out. The first 16 textures with such blocks are
+// logged with their counts. 0: uploaded as stored (the device's error colour)
+static int astc_zero_on(void) { return VKA_ENV("DM_VK_ASTC_ZERO", 1) != 0; }
+static _Atomic uint64_t g_astc_zb, g_astc_ztex;   // blocks rewritten, uploads that had some
+static void astc_zero_note(const vka_img *im, uint64_t zb, uint64_t nb) {
+    if (!zb) return;
+    atomic_fetch_add(&g_astc_zb, zb); uint64_t k = atomic_fetch_add(&g_astc_ztex, 1);
+    if (k < 16) VLOG("ASTC texture serial %llu %ux%u layers %u levels %u (base %u) format %#x: %llu of its %llu uploaded blocks all zero in its storage, uploaded as zero texels "
+                     "(void-extent (0, 0, 0, 0)) instead of the device's error colour (DM_VK_ASTC_ZERO; %llu uploads with such blocks so far)", (unsigned long long)im->serial, im->w, im->h,
+                     im->layers, im->levels, im->base, im->d.format, (unsigned long long)zb, (unsigned long long)nb, (unsigned long long)k + 1);
 }
 // Zero texels without staging: a buffer of zero blocks (first half) and of ASTC's zero blocks (second half), the source of every unmapped part of a sparse texture
 enum { ZHALF = 2 << 20 };
@@ -2236,7 +2257,7 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
 // and layer) are cut into runs of block rows (nvn_deswizzle_rows, at least ~64 KB each) that the helpers and the calling thread take in turn; the copies are recorded after
 // all of them, in the same order as before. Only uploads of at least DM_VK_UPLOAD_MT_MIN bytes (default 256 KB): the first uploads of a level's textures came in loading
 // frames, 1-93 textures a frame, all deswizzled on the replay thread one after another
-typedef struct { const nvn_texdesc *d; const uint8_t *src; uint8_t *dst; size_t pitch; uint32_t lv, ly, y0, y1; _Atomic int *bad; } up_part;   // bad: its piece's flag
+typedef struct { const nvn_texdesc *d; const uint8_t *src; uint8_t *dst; size_t pitch; uint32_t lv, ly, y0, y1; _Atomic int *bad; _Atomic uint64_t *zb; } up_part;   // bad: its piece's flag; zb: a 2D ASTC piece's count of all-zero blocks rewritten (NULL: none to rewrite)
 // A part is claimed by compare-and-swap on next while next < n: a helper that wakes late, or comes back from the last batch, can only claim a part of the batch being set up
 // once it is complete (p, then next = 0, then n; n = 0 between batches)
 static struct { pthread_mutex_t mu; pthread_cond_t cv, done_cv; _Atomic(up_part *) p; _Atomic uint32_t n, next, done; _Atomic int fail; uint64_t gen; int nth; } UP = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
@@ -2248,6 +2269,7 @@ static void up_run(void) {   // take parts until none is left
         if (!atomic_compare_exchange_weak(&UP.next, &i, i + 1)) continue;
         up_part *q = &atomic_load(&UP.p)[i];
         if (nvn_deswizzle_rows(q->d, q->lv, q->ly, q->src, q->dst, q->pitch, q->y0, q->y1)) { atomic_store(&UP.fail, 1); atomic_store(q->bad, 1); }
+        else if (q->zb) atomic_fetch_add(q->zb, astc_zero_blocks(q->dst + (size_t)q->y0 * q->pitch, (size_t)(q->y1 - q->y0) * q->pitch));   // (the rows it wrote: "ASTC storage that holds zeros")
         if (atomic_fetch_add(&UP.done, 1) + 1 == n) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.done_cv); pthread_mutex_unlock(&UP.mu); }
     }
 }
@@ -2289,41 +2311,46 @@ static int upload_mt(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *
     }
     int minb = VKA_ENV("DM_VK_UPLOAD_MT_MIN", 256 << 10);
     if (total < (uint64_t)(minb > 0 ? minb : 1) || npieces > 4096 || VKA_ENV("DM_VK_UPLOAD_MT", 3) <= 0) return 0;
-    typedef struct { vka_span s; uint32_t lv, ly, w, h, z, bx, by; size_t pitch; _Atomic int bad; } piece_t;
+    typedef struct { vka_span s; uint32_t lv, ly, w, h, z, bx, by; size_t pitch; _Atomic int bad; _Atomic uint64_t zb; } piece_t;
     piece_t *pc = malloc(npieces * sizeof *pc); up_part *parts = NULL; uint32_t np = 0, cap = 0;
     if (!pc) return 0;
-    uint32_t k = 0;
+    uint32_t k = 0; int azero = is_astc(f->vk) && astc_zero_on();   // ("ASTC storage that holds zeros": 2D pieces by their parts' rows, 3D ones whole after the parts)
     for (uint32_t lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
         uint32_t bx = (w + f->bw - 1) / f->bw, by = (h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb, piece = pitch * by * z;
         int rows = nvn_deswizzle_block_rows(d, lv + im->base);   // (texture level: the image's level 0 is the texture's level base, "Mip drop")
         if (rows < 0 || (uint32_t)rows != by) { free(pc); free(parts); return 0; }   // (a shape the serial path reports)
         for (uint32_t ly = 0; ly < im->layers; ly++, k++) {
-            piece_t *q = &pc[k]; *q = (piece_t){{0}, lv, ly, w, h, z, bx, by, pitch, 0};
+            piece_t *q = &pc[k]; *q = (piece_t){{0}, lv, ly, w, h, z, bx, by, pitch, 0, 0};
             if (!vka_scratch(piece, 16, &q->s)) goto cut;   // (no scratch: as the serial path, the pieces before it are uploaded)
             // Runs of block rows of at least ~64 KB (all slices of a 3D level in each)
             uint32_t per = (uint32_t)((65536 + pitch * z - 1) / (pitch * z)); if (!per) per = 1;
             for (uint32_t y = 0; y < by; y += per) {
                 if (np == cap) { cap = cap ? cap * 2 : 64; up_part *n2 = realloc(parts, cap * sizeof *parts); if (!n2) { free(pc); free(parts); return 0; } parts = n2; }
-                parts[np++] = (up_part){d, t->mem, q->s.ptr, pitch, lv + im->base, ly, y, y + per < by ? y + per : by, &q->bad};
+                parts[np++] = (up_part){d, t->mem, q->s.ptr, pitch, lv + im->base, ly, y, y + per < by ? y + per : by, &q->bad, azero && z == 1 ? &q->zb : NULL};
             }
         }
     }
 cut:;
     int fail = 0;
-    if (!up_parallel(parts, np, &fail)) { for (uint32_t i = 0; i < np; i++) if (nvn_deswizzle_rows(parts[i].d, parts[i].lv, parts[i].ly, parts[i].src, parts[i].dst, parts[i].pitch, parts[i].y0, parts[i].y1)) { fail = 1; *parts[i].bad = 1; } }
+    if (!up_parallel(parts, np, &fail)) { for (uint32_t i = 0; i < np; i++) { up_part *p = &parts[i];
+        if (nvn_deswizzle_rows(p->d, p->lv, p->ly, p->src, p->dst, p->pitch, p->y0, p->y1)) { fail = 1; *p->bad = 1; }
+        else if (p->zb) atomic_fetch_add(p->zb, astc_zero_blocks(p->dst + (size_t)p->y0 * p->pitch, (size_t)(p->y1 - p->y0) * p->pitch)); } }
     free(parts);
     // A piece that could not be deswizzled ends the upload there, as on the serial path: the pieces before it are copied, it and those after it are not
     if (fail) VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target);
-    uint64_t bytes = 0;
+    uint64_t bytes = 0, zb = 0;
     for (uint32_t i = 0; i < k; i++) {
         piece_t *q = &pc[i];
         if (atomic_load(&q->bad)) break;
+        if (azero && q->z > 1) atomic_fetch_add(&q->zb, astc_zero_blocks(q->s.ptr, q->pitch * q->by * q->z));
+        zb += atomic_load(&q->zb);
         VkBufferImageCopy c = {q->s.off, q->bx * f->bw, q->by * f->bh, {im->aspect, q->lv, q->ly, 1}, {0, 0, 0}, {q->w, q->h, q->z}};
         vk.vkCmdCopyBufferToImage(cb, q->s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
         bytes += q->pitch * q->by * q->z;
     }
     free(pc);
+    if (azero) astc_zero_note(im, zb, bytes / 16);
     *nbytes = bytes;
     return 1;
 }
@@ -2342,7 +2369,7 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
     uint64_t bytes = 0;
     // A sparse pool's texture: gathered from its page table by bands, unmapped ones as zero texels (until 2026-11-03 a copy of its whole range was made first)
     if (im->vpool) { if (!im->vbind) upload_sparse_parts(im, cb, 0, 0, 1, 0); return; }   // (a GPU-written one's content is the GPU's: sparse_bind)
-    uint8_t *part = NULL; const uint8_t *src = t->mem;
+    uint8_t *part = NULL; const uint8_t *src = t->mem; int azero = is_astc(f->vk) && astc_zero_on(); uint64_t zb_all = 0;
     for (uint32_t lv = 0; lv < (linear ? 1 : im->levels); lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
         uint32_t bx = (w + f->bw - 1) / f->bw, by = (h + f->bh - 1) / f->bh;
@@ -2361,14 +2388,16 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
                 }
                 static _Atomic int nz; if (zb && atomic_fetch_add(&nz, 1) < 64) VLOG("NaN scan: upload of serial %llu format %#x level %u layer %u: %llu of %llu blocks all zero (storage %p)", (unsigned long long)t->serial, d->format, lv, ly, (unsigned long long)zb, (unsigned long long)nb, (const void *)t->mem);
             }
+            if (azero) zb_all += astc_zero_blocks(s.ptr, piece);   // ("ASTC storage that holds zeros", after the NaN scan's count of them)
             VkBufferImageCopy c = {s.off, bx * f->bw, by * f->bh, {im->aspect, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
             vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
             bytes += piece;
-            if (!(cb = vka_up_point(cb))) { free(part); *nbytes = bytes; return; }
+            if (!(cb = vka_up_point(cb))) { free(part); *nbytes = bytes; astc_zero_note(im, zb_all, bytes / 16); return; }
         }
     }
     free(part);
     *nbytes = bytes;
+    if (azero) astc_zero_note(im, zb_all, bytes / 16);
     static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("texture serial %llu %ux%u format %#x: %llu bytes uploaded from guest memory", (unsigned long long)t->serial, im->w, im->h, d->format, (unsigned long long)bytes);
 }
 

@@ -146,6 +146,7 @@ static uint64_t g_probe_hit, g_probe_miss, g_probe_miss_ns;          // GPL: the
 static _Atomic uint64_t g_try_skipped;                              // cache-only tries left out (DM_VK_PSO_TRY)
 static _Atomic uint64_t g_save_ns_total, g_hy_draws, g_pw_wait_ns;
 static void pw_load(void); static void pw_start(void); static int pw_save(void); static int g_pw_dirty;
+static void cpf_ready(void);   // (compute pipelines made at program setup: their threads start building once the cache is open)
 static void *saver_main(void *a);
 static pthread_mutex_t g_save_mu = PTHREAD_MUTEX_INITIALIZER;   // one save at a time (the saver thread, a forced save)
 static pthread_mutex_t g_sv_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sv_cv = PTHREAD_COND_INITIALIZER; static int g_sv_want, g_sv_up;
@@ -228,6 +229,7 @@ static void pc_open_once(void) {
     pthread_t th;
     if (!pthread_create(&th, NULL, saver_main, NULL)) { pthread_detach(th); g_sv_up = 1; }
     pw_start();
+    cpf_ready();
 }
 static void pc_open(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, pc_open_once); }   // (the prewarm threads it starts call it too: they wait for it)
 // The cache and the prewarm list to their files. vkGetPipelineCacheData runs without g_mu (the cache is internally synchronized): holding it there kept the replay thread's
@@ -1181,6 +1183,8 @@ VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *
 // ---------- Compute pipelines ----------
 typedef struct { vka_shader *cs; VkPipelineLayout layout; } ckey;
 static kmap g_cs = {.klen = sizeof(ckey)};
+static _Atomic uint32_t g_cpf_hit, g_cpf_miss;   // made ahead at program setup (below): the driver's pipeline cache hits / misses among them
+// prewarm: 0 the frame path, 1 a prewarm thread (the list of earlier runs), 2 a program-setup thread (vka_cs_prefetch)
 static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, int *made) {
     *made = 0;
     ckey k; memset(&k, 0, sizeof k); k.cs = cs; k.layout = lay->layout;
@@ -1219,16 +1223,95 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
     pthread_mutex_lock(&g_mu);
     if (over) { p = VK_NULL_HANDLE; g_ncs_over++; } else if (r) { p = VK_NULL_HANDLE; g_nfail++; } else { g_ncs++; g_made++; if (!prewarm) g_frame_made++; }
     { uint64_t dns = now_ns() - t0; g_create_ms += dns / 1e6; if (!prewarm) g_create_ns += dns; if (!over && !r && g_pc) pc_added(dns, fb_hit(&cfb) ? PC_HIT : PC_NEW); }
-    if (!over && !r && prewarm && (cfb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) atomic_fetch_add(fb_hit(&cfb) ? &g_pw_fb_hit : &g_pw_fb_miss, 1);
+    if (!over && !r && prewarm && (cfb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT))
+        atomic_fetch_add(prewarm == 2 ? (fb_hit(&cfb) ? &g_cpf_hit : &g_cpf_miss) : (fb_hit(&cfb) ? &g_pw_fb_hit : &g_pw_fb_miss), 1);
     g->p = p; g->busy = 0; pthread_cond_broadcast(&g_busy_cv);
     pthread_mutex_unlock(&g_mu);
     if (r && !over) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("compute pipeline %016llx: %d; its dispatches are skipped", (unsigned long long)cs->key, r); }
-    { double ms_ = (now_ns() - t0) / 1e6; static _Atomic int n; if (!r && ms_ > 50 && atomic_fetch_add(&n, 1) < 200) VLOG("compute pipeline %016llx took %.0f ms%s", (unsigned long long)cs->key, ms_, prewarm ? " (prewarm)" : ""); }
+    // (the frame path's slow builds and the background ones counted apart: a few hundred builds made ahead must not use up the lines that show the frame's stalls)
+    { double ms_ = (now_ns() - t0) / 1e6; static _Atomic int nf, nb; _Atomic int *n = prewarm ? &nb : &nf;
+      if (!r && ms_ > 50 && atomic_fetch_add(n, 1) < (prewarm ? 32 : 200)) VLOG("compute pipeline %016llx took %.0f ms%s", (unsigned long long)cs->key, ms_, prewarm == 2 ? " (made ahead at program setup)" : prewarm ? " (prewarm)" : ""); }
     if (!prewarm && !over) { vka_shader *s5[5] = {cs, NULL, NULL, NULL, NULL}; pw_note(1, s5, "", 0); }   // (one not made stays out of the prewarm list)
     *made = 1;
     return p;
 }
 VkPipeline vka_cs_pipeline(vka_shader *cs, const vka_layout *lay) { int made; return cs_obtain(cs, lay, 0, &made); }
+
+// ---------- Compute pipelines made at program setup (DM_VK_CS_PREFETCH) ----------
+// A compute pipeline was made at the first dispatch of its program, on the frame path (an asynchronous build would skip the dispatch, and what reads its results, indirect
+// arguments among them, would read stale or garbage data). On RADV for the Xclipse 940 such a build takes 270-900 ms: Ocarina of Time's effect emitters about 400 ms each,
+// its foliage layout shaders up to 1 s. So the first enemy attack, sword swing or broken pot of a session froze for that long and a load of effects for seconds (fba4306
+// on the Galaxy S24+: 64 such builds in 22 minutes, 26 s in all; one frame of 5.8 s made 23). A compute pipeline needs only its shader and the layout of its records,
+// both known when the game sets the program up (nvnProgramSetShaders; Ocarina of Time sets up 3,574 programs before its first frame, effects included): each one-stage
+// program is queued then (mtl_prog_prefetch, the key SetShaders computed) and one whose library entry is a compute shader is made on DM_VK_CS_PREFETCH background threads
+// (restart; default 1, at most 4; nice 10 and paused on suspend, as the prewarm threads), in the order the game set them up, once the replay has made its first pipeline
+// (the cache is open and the texture pool's set layout is there then: the layout must be the frame path's). A dispatch that comes first makes it itself as before, or waits
+// for the thread making it (raised to its priority, busy_wait); the map holds the result either way. The driver's pipeline cache keeps them, so a later run makes each from
+// the cache in about a millisecond. Cost: background CPU in a run with a new driver or an empty cache (one build per compute program the game sets up), and each pipeline's
+// memory for the run. 0 leaves them to their first dispatch as before. The `compute prefetch:` line gives the counts when the queue runs dry
+static pthread_mutex_t g_cpf_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cpf_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t *g_cpf_q; static size_t g_cpf_n, g_cpf_cap, g_cpf_head;      // the queue: keys in setup order (under g_cpf_mu)
+static uint64_t *g_cpf_set; static size_t g_cpf_setcap, g_cpf_setn;          // every key queued in the run (open addressing, 0 = empty)
+static int g_cpf_ready, g_cpf_threads, g_cpf_busy;                            // ready: the replay made its first pipeline (pc_open_once); busy: threads on a key
+static _Atomic uint64_t g_cpf_made, g_cpf_had, g_cpf_other, g_cpf_bad, g_cpf_ns;
+static int cpf_set_add(uint64_t k) {   // caller holds g_cpf_mu; 1 = new
+    if (2 * (g_cpf_setn + 1) > g_cpf_setcap) {
+        size_t nc = g_cpf_setcap ? 2 * g_cpf_setcap : 1024; uint64_t *n = calloc(nc, sizeof *n); if (!n) return 0;
+        for (size_t i = 0; i < g_cpf_setcap; i++) if (g_cpf_set[i]) { size_t j = g_cpf_set[i] & (nc - 1); while (n[j]) j = (j + 1) & (nc - 1); n[j] = g_cpf_set[i]; }
+        free(g_cpf_set); g_cpf_set = n; g_cpf_setcap = nc;
+    }
+    size_t j = k & (g_cpf_setcap - 1);
+    for (; g_cpf_set[j]; j = (j + 1) & (g_cpf_setcap - 1)) if (g_cpf_set[j] == k) return 0;
+    g_cpf_set[j] = k; g_cpf_setn++; return 1;
+}
+static void cpf_line(void) {   // when the queue runs dry, at most every 30 s
+    static uint64_t last; uint64_t t = now_ns();
+    if (last && t - last < 30000000000ull) return;
+    last = t;
+    VLOG("compute prefetch: %zu one-stage programs set up so far; %llu compute pipelines made ahead (%.1f s of builds on %d threads; the driver's cache had %u, compiled %u), "
+         "%llu already made (an earlier dispatch or a prewarm), %llu not compute shaders, %llu not in the library or refused (DM_VK_CS_PREFETCH)", g_cpf_n,
+         (unsigned long long)atomic_load(&g_cpf_made), atomic_load(&g_cpf_ns) / 1e9, g_cpf_threads, (unsigned)atomic_load(&g_cpf_hit), (unsigned)atomic_load(&g_cpf_miss),
+         (unsigned long long)atomic_load(&g_cpf_had), (unsigned long long)atomic_load(&g_cpf_other), (unsigned long long)atomic_load(&g_cpf_bad));
+}
+static void *cpf_main(void *a) {
+    (void)a; pthread_setname_np(pthread_self(), "vk-csprefetch");
+    setpriority(PRIO_PROCESS, 0, 10);   // under the game's threads, as the prewarm threads
+    for (;;) {
+        pthread_mutex_lock(&g_cpf_mu);
+        while (!g_cpf_ready || g_cpf_head == g_cpf_n) {
+            if (g_cpf_ready && !g_cpf_busy) cpf_line();
+            pthread_cond_wait(&g_cpf_cv, &g_cpf_mu);
+        }
+        uint64_t key = g_cpf_q[g_cpf_head++]; g_cpf_busy++;
+        pthread_mutex_unlock(&g_cpf_mu);
+        pause_point();
+        if (vka_hung()) {}
+        else if (vka_shader_key_stage(key) != DMSH_VK_STAGE_CS || vka_ndve_replaced(key)) atomic_fetch_add(&g_cpf_other, 1);   // (a one-stage graphics program; a network a host path replaces)
+        else {
+            vka_shader *sh[VKA_NSTAGE]; memset(sh, 0, sizeof sh); vka_layout lay; int made = 0;
+            if (!(sh[5] = vka_shader_by_key(key)) || !vka_layout_of(sh, 1, &lay)) atomic_fetch_add(&g_cpf_bad, 1);
+            else {
+                uint64_t t0 = now_ns(); cs_obtain(sh[5], &lay, 2, &made);
+                if (made) { atomic_fetch_add(&g_cpf_made, 1); atomic_fetch_add(&g_cpf_ns, now_ns() - t0); } else atomic_fetch_add(&g_cpf_had, 1);
+            }
+            setpriority(PRIO_PROCESS, 0, 10);   // back under the game's threads if a waiting frame path raised it (busy_wait)
+        }
+        pthread_mutex_lock(&g_cpf_mu); g_cpf_busy--; if (g_cpf_head == g_cpf_n) pthread_cond_broadcast(&g_cpf_cv); pthread_mutex_unlock(&g_cpf_mu);
+    }
+    return NULL;
+}
+void vka_cs_prefetch(uint64_t key) {   // the game's thread, at nvnProgramSetShaders
+    static int nt = -1; if (nt < 0) { nt = VKA_ENV("DM_VK_CS_PREFETCH", 1); if (nt > 4) nt = 4; if (nt < 0) nt = 0; }
+    if (!nt || !key) return;
+    pthread_mutex_lock(&g_cpf_mu);
+    if (cpf_set_add(key)) {
+        if (g_cpf_n == g_cpf_cap) { size_t nc = g_cpf_cap ? 2 * g_cpf_cap : 1024; uint64_t *q = realloc(g_cpf_q, nc * sizeof *q); if (q) { g_cpf_q = q; g_cpf_cap = nc; } }
+        if (g_cpf_n < g_cpf_cap) { g_cpf_q[g_cpf_n++] = key; pthread_cond_signal(&g_cpf_cv); }
+        while (g_cpf_threads < nt) { pthread_t th; if (pthread_create(&th, NULL, cpf_main, NULL)) { nt = g_cpf_threads; break; } pthread_detach(th); g_cpf_threads++; }
+    }
+    pthread_mutex_unlock(&g_cpf_mu);
+}
+static void cpf_ready(void) { pthread_mutex_lock(&g_cpf_mu); g_cpf_ready = 1; pthread_cond_broadcast(&g_cpf_cv); pthread_mutex_unlock(&g_cpf_mu); }   // pc_open_once
 
 // ---------- Task and mesh programs as compute shaders (vka_draw.c "Mesh draws as compute") ----------
 // The pipeline of a program made a compute shader (vka_shader.emu 1), with the specialization its mesh pipeline stage would have had: GL's depth convention (SpecId 0) on

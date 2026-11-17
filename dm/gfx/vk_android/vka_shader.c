@@ -453,6 +453,11 @@ vka_shader *vka_shader_by_key(uint64_t key) {
     pthread_mutex_lock(&g_mu); int ok = lib_load(); pthread_mutex_unlock(&g_mu);
     return ok ? vka_shader_make(&g_lib, key) : NULL;
 }
+int vka_shader_key_stage(uint64_t key) {
+    pthread_mutex_lock(&g_mu); int ok = lib_load(); pthread_mutex_unlock(&g_mu);
+    const dmsh_vk_entry *e = ok ? vka_shlib_find(&g_lib, key) : NULL;
+    return e ? (int)e->stage : -1;
+}
 
 // Every shader of a library through the device's compiler: each module made, each stage's set-0 layout made, each compute shader's pipeline built (graphics pipelines need
 // a pair and state, so vertex and pixel shaders stop at the module and layout). DM_VK_SHLIB_CHECK=1 runs it when the game's library loads; the selftest runs it on DM_VK_SHLIB.
@@ -502,7 +507,13 @@ void mtl_prog_release(prog_t *p) {
     if (!p || !p->serial) return;
     pthread_mutex_lock(&g_mu); prent *e = pr_find(p->serial); if (e) { e->serial = ~0ull; memset(&e->ps, 0, sizeof e->ps); } pthread_mutex_unlock(&g_mu);   // a tombstone
 }
-void mtl_prog_prefetch(const prog_t *p) { (void)p; }   // modules are made at the program's first draw (vka_prog_shaders)
+// A program the game sets up (nvnProgramSetShaders, on its thread): a one-stage program may be a compute program, whose pipeline needs nothing but its shader and the
+// layout of its records, so it is made ahead on a background thread (vka_pso.c vka_cs_prefetch, which checks the stage). Graphics modules and pipelines are still made
+// at the program's first draw (vka_prog_shaders): their pipelines need the draw's state. Only a key SetShaders computed is taken (prog_key_known: no code area read here)
+void mtl_prog_prefetch(const prog_t *p) {
+    uint8_t md[8];
+    if (p && p->nstage == 1 && prog_key_known(p, 0, md)) vka_cs_prefetch(vka_shlib_key(md));
+}
 
 // DM_NVN_SHDUMP=directory (debugging): a stage missing from the library is saved as <key>.ctl + <key>.code, the Mac's form (nvn_mtl.m; shader_split.py nvn_dumps, runtime_shaders.py --dump),
 // once per key. The control section is hle_nvn.c's copy (nvnProgramSetShaders keeps one while SHDUMP is set), the code area is read in the game's memory pool at its address;

@@ -1303,7 +1303,11 @@ static int pool_scan(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE]) {
     int fb = !blind && vka_shader_texfb(NULL);
     if (!any_pool || !vka_tex_pool_lazy()) return 0;   // (after the first draw that reads every registered texture, or with lazy images off, there is nothing to defer)
     enum { POOL_SCAN = 64 << 20 };
-    static struct { uint64_t addr, size, t, f; } memo[16]; static unsigned memo_next;
+    // The memo: 1024 slots, 4-way by (address, size), the way scanned longest ago taken for a new buffer. It was 16 slots in turn: Ocarina of Time binds more storage
+    // buffers in a frame than that, so each pushed the shared material table out and draw after draw scanned it again (52 KiB per pool-reading draw on average over
+    // 4.2 M draws, 8.5-13 ms of the replay thread a frame on the Galaxy S24+)
+    enum { MEMO = 1024 };
+    static struct { uint64_t addr, size, t, f; } memo[MEMO];
     static uint64_t n_late, n_rescan;   // texture IDs queued by rescans of memoized buffers, and those rescans
     uint64_t tnow = now_ns(), fr = vka_frame(); int rescan_ms = VKA_ENV("DM_VK_POOL_RESCAN_MS", 0);
 #define VLOG_ONCE_POOL(fmt, ...) do { static _Atomic int nl_; if (atomic_fetch_add(&nl_, 1) < 4) VLOG("texture pool: shader %016llx (stage %d) reads it, every registered texture gets its image: " fmt, (unsigned long long)sh[st]->key, st, __VA_ARGS__); } while (0)
@@ -1325,10 +1329,13 @@ static int pool_scan(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE]) {
         for (int i = 0; i < g_wk.n[st] && !all; i++) { const vka_res *r = &g_wk.r[st][i];
             if (r->what != VKA_R_BUF || r->desc != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || !r->addr) continue;
             uint64_t sz = r->size ? r->size : 65536;   // (size 0: to the end of its placed chunk; the first 64 KiB of it)
-            int m = 0; while (m < 16 && !(memo[m].addr == r->addr && memo[m].size == sz)) m++;
-            if (m < 16 && (rescan_ms > 0 ? tnow - memo[m].t < (uint64_t)rescan_ms * 1000000ull : memo[m].f == fr)) continue;
-            int again = m < 16; uint64_t t_was = again ? memo[m].t : 0, f_was = again ? memo[m].f : 0;
-            if (m == 16) { m = (int)(memo_next++ & 15); memo[m].addr = r->addr; memo[m].size = sz; }
+            unsigned h = (unsigned)(((r->addr ^ sz << 40) * 0x9E3779B97F4A7C15ull) >> 54), m = MEMO, old = h;
+            for (unsigned w = 0; w < 4; w++) { unsigned s = (h + w) & (MEMO - 1);
+                if (memo[s].addr == r->addr && memo[s].size == sz) { m = s; break; }
+                if (memo[s].f < memo[old].f) old = s; }
+            if (m < MEMO && (rescan_ms > 0 ? tnow - memo[m].t < (uint64_t)rescan_ms * 1000000ull : memo[m].f == fr)) continue;
+            int again = m < MEMO; uint64_t t_was = again ? memo[m].t : 0, f_was = again ? memo[m].f : 0;
+            if (m == MEMO) { m = old; memo[m].addr = r->addr; memo[m].size = sz; }
             memo[m].t = tnow; memo[m].f = fr;
             if (scanned + sz > POOL_SCAN) { all = 1; VLOG_ONCE_POOL("its draw's storage buffer binding %u at %#llx is %#llx bytes, over the scan's %u", r->binding, (unsigned long long)r->addr, (unsigned long long)sz, (unsigned)POOL_SCAN); break; }
             scanned += sz;

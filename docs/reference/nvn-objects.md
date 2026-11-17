@@ -489,6 +489,14 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** a sampled texture in a sparse pool (not a render target, image, linear or buffer texture) is now uploaded like a packaged one, through the pool's page table ([Textures read through a 4 KB page table of a sparse pool](#textures-read-through-a-4-kb-page-table-of-a-sparse-pool)).
 - **Found on:** Monster Hunter Rise: the hunter's innerwear (ASTC 6x6) came out magenta and the face black.
 
+### ASTC storage that holds all-zero blocks (Android)
+
+- **Symptom:** (Vulkan replay) a mosaic of magenta blocks on terrain, objects tinted pink and pink fringes along edges, where the Switch shows none.
+- **Cause:** an all-zero 128-bit ASTC block is a reserved encoding, which a Vulkan device decodes to its error colour: opaque magenta (1, 0, 1, 1) on RADV for the Xclipse 940 (as on Metal), NaN on the Adreno 840. Storage the game has not filled (yet) holds such blocks: layers of an array that stream in later, levels that come after the texture's first use, and a compressed texture whose content is the GPU's (`ST_ZERO`), which `img_first_use` fills from its storage because Vulkan cannot clear a compressed image. Only the unmapped pages of sparse textures were uploaded as zero texels (`k_astc_zero`, the void-extent block of colour (0, 0, 0, 0)).
+- **Fix (a workaround):** every dense upload (`upload_`'s serial path and `upload_mt`'s parts, `vka_tex.c`) writes all-zero ASTC blocks as `k_astc_zero` (`DM_VK_ASTC_ZERO`, live, on; `0` uploads them as stored). No valid encoder writes an all-zero block, so only storage that holds no texture data changes. The first 16 textures with such blocks are logged (`ASTC texture serial … uploaded as zero texels`).
+- **Open:** what the Switch's decoder returns for such a block is not measured (it draws no magenta there), and whether those blocks are empty on the Switch too or hold data a missed fill (a CPU write the host did not see, a GPU write through another view) left out. Blocks the GPU writes later are not rewritten.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on the Galaxy S24+ (fba4306): Death Mountain's cliffs, the Goron pot and fringes along edges. Its terrain blends layers of two 90-layer 1365×1365 ASTC 8×8 arrays (serials 4003 / 4004, flags IMAGE); a blend that picks a layer by its alpha (a height) lets an error block's alpha 1 win over the real layer. Not yet checked on the phone.
+
 ### Dirty-page ranges of pools that share a host page
 
 - **Symptom:** some textures are re-uploaded every frame (several MB per frame).
