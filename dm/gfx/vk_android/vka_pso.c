@@ -701,10 +701,17 @@ static VkPipeline gpl_link(pstate *P, const vka_gkey *k) {
 typedef struct opt_job { struct opt_job *next; gval *g; vka_shader *sh[VKA_NSTAGE]; vka_layout lay; vka_gkey k; } opt_job;
 static opt_job *g_opt_head, **g_opt_tail = &g_opt_head; static pthread_mutex_t g_opt_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_opt_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_opt_waiting;
+static _Atomic int g_as_depth;   // (asynchronous jobs queued or being made, below)
+// The optimizer works only while no asynchronous job waits, and under the game's threads: its pipelines replace linked ones that already draw, while a job's draws are
+// skipped until it is made. It was a third compiling thread beside DM_VK_PSO_ASYNC's two (inheriting the priority of whichever thread queued its first job), so at an
+// area change the copies of pipelines already drawing took CPU from the missing ones: Ocarina of Time on the Galaxy S24+ (fba4306) skipped 24,488 draws in 22 minutes,
+// objects invisible for up to 8 s, with 1,224 pipelines also optimized in the same bursts
 static void *opt_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-psopt");
+    setpriority(PRIO_PROCESS, 0, 10);
     for (;;) {
         pause_point();
+        while (atomic_load(&g_as_depth) > 0) { struct timespec ts = {0, 5000000}; nanosleep(&ts, NULL); }
         pthread_mutex_lock(&g_opt_mu);
         while (!g_opt_head) pthread_cond_wait(&g_opt_cv, &g_opt_mu);
         opt_job *j = g_opt_head; g_opt_head = j->next; if (!g_opt_head) g_opt_tail = &g_opt_head;
